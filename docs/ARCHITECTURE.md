@@ -122,13 +122,27 @@ The reproducible script [`phase0_bench/run_phase0.py`](../phase0_bench/run_phase
 Using the integer-counter Cyclone V PLL pattern proven in [SpaceFish `f3_pll.sv`](https://github.com/DanimanX/SpaceFish) (`600 MHz ≤ f_vco ≤ 1300 MHz`, `PFD ≥ 5 MHz`):
 
 - **PLL 1 (`m2_pll.sv`):** `N = 12`, `M = 155` → `PFD = 6.1875 MHz`, **`f_vco = 959.0625 MHz`**
-  - `C0 = 10` → **`clk_mem = 95.906 MHz`** (`dram_*` + `psram_phy` at `CLKDIV=2` → PSRAM K = `47.95 MHz`)
-  - `C0 = 10` (+180°) → **`clk_sdram_pin = 95.906 MHz`**
-  - `C1 = 12` → **`clk_sys = 79.922 MHz`** (−0.098% vs. 80 MHz)
-  - `C2 = 30` → **`clk_cart = 31.969 MHz`** (cartridge bus clock → **63.9 MB/s**)
-  - `C3 = 60` → **`clk_pix = 15.984 MHz`** (−0.098% vs. 16.00 MHz → **57.47 Hz**)
-  - `C4 = 60` (+90° = `15,640 ps`) → **`clk_pix_90 = 15.984 MHz`** (APF DDR video sampling)
-- **PLL 2 (`m2_audio_pll.sv`):** **`audio_mclk = 12.288 MHz`** (48 kHz I2S DAC, identical to SpaceFish).
+  - `C0 = 10` → **`clk_mem = 95.906250 MHz`** (`dram_*` + `psram_phy` at `CLKDIV=2` → PSRAM K = `47.95 MHz`)
+  - `C1 = 10` (+180° = `5,213 ps`) → **`clk_sdram_pin = 95.906250 MHz`**
+  - `C2 = 13` → **`clk_sys = 73.774038 MHz`** (`m2_raster3d` + FB + Cart Bus; **verified `+0.752 ns` Slow 85°C / `+0.296 ns` Slow 0°C setup slack on `5CEBA4F23C8`**)
+  - `C3 = 30` → **`clk_cart = 31.968750 MHz`** (cartridge bus clock → **63.9 MB/s**)
+  - `C4 = 60` → **`clk_pix = 15.984375 MHz`** (−0.098% vs. 16.00 MHz → **57.47 Hz**)
+  - `C5 = 60` (+90° = `15,640 ps`) → **`clk_pix_90 = 15.984375 MHz`** (APF DDR video sampling)
+- **PLL 2 (`m2_audio_pll.sv`):** **`audio_mclk = 12.288 MHz`** (48 kHz I2S DAC, fractional-N PLL reused from SpaceFish `f3_audio_pll.sv`).
+
+---
+
+## 4.1 Phase 1 Verified Silicon Fit (`5CEBA4F23C8` · Quartus Prime 25.1 Lite)
+
+Full place-and-route and 4-corner Static Timing Analysis of [`src/fpga/pocket_deadorpocket.qpf`](../src/fpga/pocket_deadorpocket.qpf) (`HIGH PERFORMANCE EFFORT`, `SYNTH_TIMING_DRIVEN_SYNTHESIS ON`):
+
+- **Logic utilization (ALMs):** `10,373 / 18,480` (**56%**)
+- **Total registers:** `14,149`
+- **Total block memory bits:** `2,735,996 / 3,153,920` (**87%**)
+- **Total M10K RAM blocks:** `303 / 308` (**98%**) — achieved by moving small span/CDC queues (`u_span_q` in `m2_raster3d.sv` and `q_tex`/`q_u`/`q_v` in `m2_texel_cdc.sv`) to MLABs, keeping **all 256 KB of Async SRAM (`sram_*`) free** for Phase 2!
+- **Total DSP blocks:** `55 / 66` (**83%**)
+- **Total PLLs:** `2 / 4` (**50%**)
+- **4-Corner STA (`Slow 85C`, `Slow 0C`, `Fast 85C`, `Fast 0C`):** **0.000 ns TNS** across all 7 clock domains (`clk_sys` `+0.296 ns` min setup, `clk_mem` `+1.176 ns` min setup, all hold/recovery/removal/MPW positive).
 
 ---
 

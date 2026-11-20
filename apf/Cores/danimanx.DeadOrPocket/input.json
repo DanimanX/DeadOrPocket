@@ -1,0 +1,25 @@
+{
+    "input": {
+        "magic": "APF_VER_1",
+        "controllers": [
+            {
+                "type": "default",
+                "mappings": [
+                    { "id": 3,  "name": "Up",             "key": "pad_dpad_up" },
+                    { "id": 2,  "name": "Down",           "key": "pad_dpad_down" },
+                    { "id": 1,  "name": "Left",           "key": "pad_dpad_left" },
+                    { "id": 0,  "name": "Right",          "key": "pad_dpad_right" },
+                    { "id": 4,  "name": "Hold / View 1",  "key": "pad_btn_y" },
+                    { "id": 5,  "name": "Punch / Brake",  "key": "pad_btn_b" },
+                    { "id": 6,  "name": "Kick / Accel",   "key": "pad_btn_a" },
+                    { "id": 7,  "name": "Action 4",       "key": "pad_btn_x" },
+                    { "id": 8,  "name": "Gear / View 2",  "key": "pad_trig_l" },
+                    { "id": 9,  "name": "Gear / View 3",  "key": "pad_trig_r" },
+                    { "id": 10, "name": "1P Start",       "key": "pad_btn_start" },
+                    { "id": 11, "name": "Insert Coin",    "key": "pad_btn_select" },
+                    { "id": 12, "name": "Test / Service", "key": "pad_trig_l2" }
+                ]
+            }
+        ]
+    }
+}

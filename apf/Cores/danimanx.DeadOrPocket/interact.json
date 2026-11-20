@@ -1,0 +1,65 @@
+{
+    "interact": {
+        "magic": "APF_VER_1",
+        "variables": [
+            {
+                "name": "Reset Core",
+                "id": 0,
+                "type": "action",
+                "enabled": true,
+                "address": "0xF0000000",
+                "value": 1
+            },
+            {
+                "name": "3D Self-Test Demo",
+                "id": 1,
+                "type": "check",
+                "enabled": true,
+                "persist": false,
+                "writeonly": true,
+                "address": "0xF0000004",
+                "value": 1,
+                "defaultval": 1
+            },
+            {
+                "name": "Bilinear Filter",
+                "id": 2,
+                "type": "check",
+                "enabled": true,
+                "persist": true,
+                "writeonly": true,
+                "address": "0xF0000008",
+                "value": 1,
+                "defaultval": 1
+            },
+            {
+                "name": "Debug Overlay",
+                "id": 3,
+                "type": "check",
+                "enabled": true,
+                "persist": false,
+                "writeonly": true,
+                "address": "0xF000000C",
+                "value": 1,
+                "defaultval": 0
+            },
+            {
+                "name": "Mip-Mapping",
+                "id": 4,
+                "type": "list",
+                "enabled": true,
+                "persist": true,
+                "writeonly": true,
+                "address": "0xF0000010",
+                "options": [
+                    { "name": "Off", "value": 0 },
+                    { "name": "Sharp (Default)", "value": 1 },
+                    { "name": "Medium", "value": 2 },
+                    { "name": "Smooth", "value": 3 }
+                ],
+                "defaultval": 1
+            }
+        ],
+        "messages": null
+    }
+}

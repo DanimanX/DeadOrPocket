@@ -28,4 +28,10 @@ roms/*
 !roms/README.md
 *.rom
 *.zip
+!Release/DeadOrPocket_Pocket_*.zip
 *.7z
+
+# Unpacked SD release staging & temporary asset previews
+Release/sd_card/
+docs/kasumi_raw.jpg
+docs/*_preview.png

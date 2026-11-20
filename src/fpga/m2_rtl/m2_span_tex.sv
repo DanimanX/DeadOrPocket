@@ -1,0 +1,1484 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Sega Model 2 core for MiSTer FPGA
+// Copyright (C) 2026 alphanu1
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the Free
+// Software Foundation, either version 3 of the License, or (at your option)
+// any later version. See LICENSE for the full text.
+//
+// TEXTURING A SPAN, one pixel at a time, between the quad filler and the band
+// buffer.
+//
+// WHY IT SITS HERE AND NOT IN THE BAND. A band buffer writes FOUR pixels a
+// cycle because a flat span is one colour repeated, and that is most of what
+// makes the 3D fit its beam slot. A textured span is a different colour per
+// pixel, so it cannot use that path -- but it does not have to CHANGE it
+// either: a one-pixel span is a perfectly good span, and the band already
+// takes one per handshake. So this unit expands a textured span into a run of
+// single-pixel spans and the band is untouched, stipple and clipping included.
+//
+// AN UNTEXTURED SPAN PASSES STRAIGHT THROUGH, COMBINATIONALLY, AND THAT IS NOT
+// AN OPTIMISATION -- IT IS A CORRECTNESS PROPERTY. Registering it instead costs
+// one cycle a span, and tb_m2_raster3d caught exactly that: the reference's own
+// frame painted 6,396 pixels where the frame before it painted 5,945, because
+// the fill no longer finished inside its beam slot and the band went up with
+// part of the picture missing. The bands are beam-paced, so latency in this
+// path is not free and a flat span must cost what it always did.
+//
+// THE COLOUR. The reference maps the texel through the luma table and then
+// through the colour table:
+//
+//     luma = lumaram[lumabase + (t >> 1)] * object.luma / 256;
+//     colour = gamma(colortable_{r,g,b}[(colorbase_ch << 8) | luma])
+//
+// R275 scaled the polygon's finished colour by the texel. R784: that kept one
+// hue per polygon and lost every channel the table saturates, and it ignored
+// the luma table, which Daytona uses inverted (row 1) on its decals -- their
+// yellow came out black. Now, with the table read once per polygon at luma 32
+// by m2_geo_engine (in_col, the slope: gam_MAME(xlat[comp][32]) * L / 256):
+//
+//     lum   = lumabase row 1 ? 63 - t/4 : t/4        (t on the reference's
+//             0..240 scale; in_tex[11] carries "row 1", see m2_raster3d)
+//     pixel = (col == 0 || lum == 0) ? 0 : min(255, A + col * lum / 32)
+//
+// A is the output curve's pedestal: 0 for MAME's, 64 Off, 37 Mild (their
+// gain is folded into col). Measured on MAME's lists against the exact path:
+// mean error 4-7 of 255 and no pixel over 32 (MAME's curve), where R275's
+// model was 13-31 and 8-57% over 32 (study R784).
+
+`timescale 1ns/1ps
+
+module m2_span_tex #(
+  // TWO PIXELS PER TEXEL FETCH (R279). A textured span costs a fetch and a
+  // handshake per pixel, and the bands are beam-paced: at four cycles a pixel
+  // a busy frame does not finish. One texel covering two pixels halves both
+  // costs, and on this screen it is barely visible -- Daytona's textures are
+  // magnified far more often than minified, so adjacent pixels usually share a
+  // texel anyway. Set to 1 to fetch per pixel.
+  // R650: UNUSED -- the step is the run-time `pxk` input. Kept so existing
+  // instantiations and build scripts still elaborate.
+  /* verilator lint_off UNUSEDPARAM */
+  parameter int unsigned PIXSTEP = 2,
+  /* verilator lint_on UNUSEDPARAM */
+  // R539: texel fetches in flight; must equal m2_texel_x2's K.
+  parameter int unsigned TXK = 4,
+  // R607: FRONT TO BACK. A group whose pixels are all already painted this
+  // band -- by a nearer polygon -- is not fetched: the reference never
+  // fetches a filled pixel (model2rd.ipp: `if (fill[x] > 0) continue;`
+  // before the texel). This copy of m2_raster3d's fill mask is read here; the
+  // band's own check, per pixel at the write, is what keeps the picture exact,
+  // so a stale or conservative answer here only costs a fetch.
+  parameter bit          FTB    = 1'b0,
+  // R633: HALF THE FETCHES WHILE LATE. With REUSE, a group issued while `late`
+  // is high, directly after a fetched group of the same span, fetches nothing
+  // and paints with its neighbour's texel -- fetch, reuse, fetch, reuse.
+  // Modelled on MAME's heavy frames: with m2_texel_bl's point mode (R627)
+  // it cuts the misses by 57-59% where point alone cuts 37%.
+  parameter bit          REUSE  = 1'b0,
+  // R813: SPAN CULL. A span whose pixels are all painted already (FTB) is
+  // dropped at the input instead of being walked a group a cycle. CULLG
+  // pixels are checked as one (a span's ends are rounded out to them).
+  parameter bit          SPCULL = 1'b0,   // R813: off -- the whole of R813 did not fit (s995-s997); s999 closes without it
+  parameter int unsigned CULLG  = 4,
+  // R616: SAMPLE EACH GROUP AT ITS CENTRE. One texel serves PIXSTEP pixels;
+  // taken at the group's first pixel it lags the rest by up to PIXSTEP-1
+  // pixels of gradient. 1 starts the walk (PIXSTEP-1)/2 pixels in, for u/z,
+  // v/z and 1/z alike so the divide still pairs them at one point.
+  parameter bit          GC     = 1'b0,
+  // R791: m2_raster_fill's UZF -- u/z and v/z arrive with UZF more bits, as
+  // (u/z) << 18 (18 - UZF fraction bits) with gradients in units of 2^-UZF.
+  // Must equal the fill's. The divide's answer is the same 16.16 quarter-
+  // texel coordinate for every UZF: the un-normalise shifts two more.
+  parameter int unsigned UZF    = 4,
+  // R828: MIP LEVELS. Each group's level is chosen from the span's in_mipk (the
+  // quad's edge footprint, m2_raster_fill MIP) and the group's own 1/z, where
+  // the divide already has its log: L = floor((K - 2 log2(ooz)) / 4), clamped
+  // to [0, the deepest level whose smaller side is 32 texels for a translucent
+  // texture, 16 for an opaque one] (R828b; MAME's own cap is the 2x2 level,
+  // R828's was min(log2 min(w, h) - 1, 7)). The divide's un-normalising shift takes
+  // L more, so u and v leave already at the level, and L rides to m2_texel_bl
+  // in tx_tex[26:24], which addresses the level's copy. 0: level 0 always, and
+  // the walk is the one before R828.
+  parameter bit          MIP    = 1'b0,
+  // R867: THE TEXTURED COLOUR THROUGH THE REFERENCE'S OWN TABLES. 0: R784's
+  // model (in_col the slope, the luma table taken as Daytona's two rows). 1:
+  // in_col of a textured span is {3'd0, luma slot[2:0], polygon luma[7:0],
+  // colour base[9:0]} and each pixel is MAME's
+  //     L = min(63, lumaram[row][t >> 1] * luma >> 8)
+  //     colour = gamma(colorxlat[ch][palette3d[base].c5[ch]][L])
+  // from three shadows written by lut_* (the CPU's writes to eight rows of the
+  // luma RAM, the game's own -- Model2.sv; to the 3D palette; and to the
+  // colour table, luma 0-63). Five
+  // stages between the retire and the output instead of one (study R867).
+  parameter bit          TEXLUT = 1'b0,
+  // R940: in_uvs is honoured (m2_geometry UVSH): the un-normalising shift is
+  // one shift less s. 0: in_uvs is ignored and the divide is as before.
+  parameter bit          UVSH   = 1'b0,
+  // R951: each fetch's level-0 coordinate clamped into its quad's texel box
+  // (m2_raster_fill UVCL). 0: as before.
+  parameter bit          UVCL   = 1'b0,
+  // R955: a negative divided coordinate clamps to 0, as to_tx says it does.
+  // 0: as before (it saturated to the top of the sheet).
+  parameter bit          NEGZ   = 1'b0,
+  parameter int unsigned SCR_W  = 496,
+  parameter int unsigned BAND_H = 8,
+  // Derived -- never overridden. PARAMETERS, not localparams: Quartus 17.0
+  // rejects a localparam in the parameter port list, where Verilator takes it.
+  parameter int unsigned MROW  = (SCR_W + 31) / 32,
+  parameter int unsigned MDEP  = BAND_H * MROW,
+  parameter int unsigned MAW   = $clog2(MDEP)
+) (
+  input  logic               clk,
+  input  logic               rst_n,
+  // R607: the fill mask -- written by m2_raster3d as the band paints.
+  input  logic [MDEP-1:0]    mk_valid,
+  input  logic               mk_we,
+  input  logic [MAW-1:0]     mk_waddr,
+  input  logic [31:0]        mk_wdata,
+  input  logic signed [15:0] mk_band_y0,
+
+  // ---- span in, from m2_raster_fill
+  // R650: THE TEXEL STEP AT RUN TIME (OSD), log2 of the pixels one texel
+  // serves: 0-3 for 1, 2, 4, 8. Latched with each span, so a change lands on
+  // the next span and never inside one. PIXSTEP above is now unused.
+  input  logic [1:0]         pxk,
+  input  logic               in_valid,
+  output logic               in_ready,
+  input  logic signed [31:0] in_y, in_x0, in_x1,
+  input  logic [23:0]        in_col,
+  input  logic               in_moire,
+  // R791: u/z, v/z in quarter-texels times 2^18 -- 18 - UZF fraction bits of
+  // a value scaled by 2^UZF (was 16.16 unscaled, i.e. times 2^16).
+  input  logic signed [31:0] in_u, in_v,
+  // 16.8 in units of 2^-UZF, shifted up to the values' fraction bits on the way in.
+  input  logic signed [23:0] in_dudx, in_dvdx,     // R618: 16.8
+  // R339: 1/z at the span's start and its gradient along x. u and v above are
+  // u/z and v/z, and the texel coordinate is u = (uoz << 15) / ooz -- the
+  // perspective divide, done once per PIXSTEP group.
+  input  logic signed [31:0] in_ooz,
+  input  logic signed [23:0] in_doozdx,
+  input  logic [23:0]        in_tex,
+  input  logic               in_tex_en,
+  // R940: the span's quad was stored with u and v >> in_uvs (m2_geometry
+  // UVSH); the divided coordinate is shifted back up by as much. 0: as before.
+  input  logic [1:0]         in_uvs,
+  // R828: the span's mip bias (m2_raster_fill span_mipk), quarter levels with
+  // the constant folded in; -512 = no level (the quad had no usable edge)
+  /* verilator lint_off UNUSEDSIGNAL */
+  input  logic signed [9:0]  in_mipk,
+  /* verilator lint_on UNUSEDSIGNAL */
+  // R951: the span's quad's texel box {off, u lo, u hm, v lo, v hm} (11-bit
+  // whole texels) is a word of m2_raster3d's box queue: in_ubi says which,
+  // valid with every textured span (the queue keeps a quad's word until the
+  // next quad's first span has gone, and the word before that unwritten while
+  // a slot may still name it). The clamp reads it back at the coordinate's
+  // stage -- ub_ra out, ub_rd in, an MLAB's asynchronous read -- so a slot
+  // carries 5 bits, not 45.
+  input  logic [4:0]         in_ubi,
+  output logic [4:0]         ub_ra,
+  input  logic [44:0]        ub_rd,
+
+  // ---- span out, to the band buffers
+  // R310: A SPAN IS STILL INSIDE THIS UNIT. With a FIFO in front, the quad
+  // store running dry no longer means the spans have been painted -- they can
+  // still be queued or mid-fetch, and a span that outlives its band is painted
+  // into the NEXT one. The band sequencer waits on this.
+  output logic               busy,
+  output logic               out_valid,
+  input  logic               out_ready,
+  output logic signed [31:0] out_y, out_x0, out_x1,
+  output logic [23:0]        out_col,
+  output logic               out_moire,
+
+  // ---- the texel fetch. R539: ISSUED, NOT HELD. tx_req is a one-cycle issue
+  // with its payload, taken whenever tx_rdy; answers come back in issue order
+  // on tx_ack/tx_texel and are consumed with tx_take. Up to TXK in flight.
+  output logic               tx_req,
+  input  logic               tx_rdy,
+  input  logic               tx_ack,
+  output logic [31:0]        tx_tex,
+  output logic [19:0]        tx_u, tx_v,
+  // R620: {discard, t} from m2_texel_bl -- t is the filtered 8-bit texel and
+  // discard is the reference's translucent test, made where the four texels are.
+  input  logic [8:0]         tx_texel,
+  output logic               tx_take,
+  input  logic               late,            // R633: m2_raster3d's tex_late
+  // R784: the OSD's output curve (m2_geo_engine's encoding: 0 MAME, 1 Mild,
+  // 2/3 Off), for the pedestal a textured pixel adds. Quasi-static.
+  input  logic [1:0]         gamma_sel,
+  // R867: the table shadows' write port (TEXLUT only). sel 0 the luma RAM
+  // ({slot[2:0], index[6:0]}, data[7:0]), 1 the 3D palette (entry[9:0],
+  // data[14:0]), 2 the colour table ({channel[1:0], c5[4:0], luma[5:0]},
+  // data[7:0]).
+  /* verilator lint_off UNUSEDSIGNAL */
+  input  logic               lut_we,
+  input  logic [1:0]         lut_sel,
+  input  logic [12:0]        lut_addr,
+  input  logic [15:0]        lut_data,
+  /* verilator lint_on UNUSEDSIGNAL */
+
+  output logic [31:0]        dbg_texpix,      // textured pixels emitted
+  // TEXELS THAT ARE NOT 0xF, which is the question "did the game upload its
+  // textures at all". Unwritten memory reads 0xFFFF by this project's standing
+  // rule, so an empty sheet returns 0xF for every texel and a textured polygon
+  // comes out FLAT AND FULL BRIGHTNESS -- indistinguishable, by eye, from a
+  // texture path that does nothing. tb_m2_boot sees no CPU write to either
+  // sheet in 20 M instructions, so this is not a hypothetical.
+  output logic [31:0]        dbg_texnz,
+  // R446: kept so m2_raster3d and Model2.sv stay byte-identical to the build
+  // this is being tested against. The current state costs nothing to expose;
+  // the dwell counter that used to sit behind it is gone (R443).
+  output logic [2:0]         dbg_hot,
+  output logic [15:0]        dbg_hotcyc,
+  // R554: wait_why on a port, so the board can count it (R551 made it for the
+  // bench; the board's late bands are texture-bound and this says on what).
+  output logic [2:0]         dbg_wait
+);
+
+  typedef enum logic [2:0] { T_IDLE, T_RUN, T_DRAIN } st_t;   // R476
+  st_t st;
+
+  // R490: TWO SETS OF THE OUTPUT-SIDE SPAN PARAMETERS, so the divide pipeline
+  // never drains between spans. R488 measured the walk at 8 + 2*groups cycles,
+  // and the 8 is this six-deep pipeline refilling from empty on EVERY span --
+  // two thirds of the cost of a short one, and 13-26% of a band's whole
+  // ~15,750-cycle budget.
+  //
+  // Only the OUTPUT side needs duplicating. du/dv/doz and the issue pointer are
+  // finished with a span the moment its last group is issued, which is exactly
+  // when the next span is now accepted, so they stay single.
+  //
+  // Depth two, in order: sp_iss is the span being issued, sp_out the span whose
+  // groups are reaching the output, sp_n how many are in flight. No per-stage
+  // tag is needed because the pipeline preserves order and sh_last already
+  // marks each span's final group -- the output advances sp_out when it sees
+  // one leave.
+  // R813: y, x1 -- and the walk's x (iss_x, 17 bits: x1 + 7 for any 16-bit
+  // x1), the retire stage's and the emit's -- are 16 bits, not 32. Every span
+  // comes from the 16-bit queue (m2_raster3d sign-extends sq_y/x0/x1) and
+  // every consumer of out_y/x0/x1 takes [15:0] (R553, R684), so the values are
+  // the same; the 32-bit adders and compares were ~54 ALUT in the full map
+  // (-111 registers standalone), which pays most of the span cull below.
+  logic signed [15:0] y_p [2], x1_p [2];
+  logic [1:0]         k_p [2];      // R650: each span's pxk, latched with it
+  function automatic logic signed [31:0] stp(input logic [1:0] k);
+    stp = 32'sd1 <<< k;
+  endfunction
+  logic        sp_iss, sp_out;
+  logic  [1:0] sp_n;
+  logic [23:0]        col_p [2];
+  logic               moire_p [2];
+  // R828: each span's mip bias and deepest level, latched with it
+  logic signed [9:0]  mipk_p [2];
+  logic [2:0]         mipl_p [2];
+  logic [1:0]         uvs_p [2];   // R940
+  logic [4:0]         ubi_p [2];   // R951: the span's quad's box, as a word of the box queue
+  // R476: u_r/v_r/ooz_r are gone -- the issue pointer walks the span and the
+  // gradients are all the consumer needs.
+  logic signed [31:0] du_r, dv_r;
+  // R339: 1/z walks the span exactly as u and v do.
+  logic signed [31:0] doz_r;
+  // R539: uq_r/vq_r are gone -- the fetch takes d4_u/d4_v with its issue.
+  // R433: the Newton step and the coordinate multiply, split across cycles.
+  // R446: THE DIVIDE MOVES BESIDE THE FETCH INSTEAD OF IN FRONT OF IT.
+  //
+  // As four FSM states the walk ran T_RCP1..4 -> T_FETCH -> T_EMIT for EVERY
+  // PIXSTEP group: four cycles of divide serialised ahead of every texel fetch,
+  // on spans ~125 groups wide. Before orientation a group was T_FETCH ->
+  // T_EMIT. That serialisation is why bands fell from 41-85% to one or two.
+  //
+  // 1/z is linear, so the NEXT group's value is known as soon as this one
+  // starts: u_nxt/ooz_nxt below. The four stages become a pipeline clocked
+  // every cycle on those, so group N+1's coordinates are computed WHILE group
+  // N's texel is in flight, and the fetch never waits for a divide again.
+  // Only the first group of a span pays, once, in T_WARM.
+
+  // Clamp to a positive 32-bit value: a vertex far enough away makes the
+  // coordinate enormous, and to_tx would read a wrapped one as a small texel.
+  function automatic logic signed [31:0] sat32(input logic [63:0] v);
+    sat32 = (v[63:31] != 33'd0) ? 32'sh7FFFFFFF : 32'(v);
+  endfunction
+
+  // R339: THE RECIPROCAL SEED, 128 ENTRIES ON THE TOP 8 BITS.
+  //
+  // A plain table accurate enough for half a texel needs ~12 index bits --
+  // 4,096 entries, about 1,000 ALM in MLAB, and there is no M10K left at
+  // 553/553. ONE NEWTON STEP buys those bits in DSP instead, which is the
+  // resource with 49 blocks idle:
+  //
+  //     seed alone       7.8e-3   ->  2.0     texels on a 256-texel coordinate
+  //     + one Newton     6.1e-5   ->  0.016   texels
+  //
+  // which is an order of magnitude under what the plane fit's own quantisation
+  // contributes (0.02 to 0.59 texels, R338), so the divide is not the limit.
+  (* ramstyle = "MLAB" *) logic [24:0] rcp_tab [128];
+  initial begin
+    for (int i = 0; i < 128; i++)
+      rcp_tab[i] = 25'((64'd1 <<< 47) / (64'(128 + i) <<< 16));
+  end
+
+  // Where the leading one of ooz sits, so it can be normalised to [2^23, 2^24).
+  // R847: AS TWO LEVELS, NOT A CHAIN. Written as a loop over 32 bits with
+  // "n == 0" in the condition, Quartus built a priority chain: iss_ooz ->
+  // d0_e was 11 cells deep on s1129 (-0.702 ns, 106 paths at 80 MHz). Now
+  // each byte encodes its own top bit (8 inputs, one or two LUTs) beside its
+  // OR, and the highest non-zero byte picks one: the same number -- the top
+  // set bit's index, 0 when there is none.
+  function automatic logic [2:0] top_bit8(input logic [7:0] b);
+    logic [2:0] n;
+    begin
+      n = 3'd0;
+      for (int i = 0; i < 8; i++) if (b[i]) n = 3'(i);
+      top_bit8 = n;
+    end
+  endfunction
+  function automatic logic [5:0] top_bit(input logic [31:0] v);
+    logic [2:0] e3, e2, e1, e0;
+    begin
+      e3 = top_bit8(v[31:24]); e2 = top_bit8(v[23:16]);
+      e1 = top_bit8(v[15:8]);  e0 = top_bit8(v[7:0]);
+      top_bit = (|v[31:24]) ? {1'b0, 2'd3, e3}
+              : (|v[23:16]) ? {1'b0, 2'd2, e2}
+              : (|v[15:8])  ? {1'b0, 2'd1, e1}
+              :               {1'b0, 2'd0, e0};
+    end
+  endfunction
+  logic [23:0]        tex_p [2];
+  // R476: no registered texel -- the emit uses the one that has just arrived.
+  // A FETCH THAT NEVER ANSWERS MUST NOT STOP THE BAND. m2_texel has its own
+  // timeout on the memory, but it also goes deaf while it sweeps its tags, and
+  // this walk is inside the band fill -- a wait here is a band that never
+  // completes and a picture that stops. On expiry the texel is taken as 0xF,
+  // which is what unwritten memory reads anyway.
+  // R539: to_cnt is gone. A fetch the cache cannot take is answered by
+  // m2_texel_x2 (0xF, in order), which is where the timeout can keep order.
+
+  // The stored coordinate is quarter-texels with sixteen fractional bits; the
+  // fetch wants texels with eight, which is ten bits to the right. Negative
+  // coordinates clamp to zero rather than wrapping into the top of the sheet:
+  // a plane fitted through a clipped quad can step slightly outside it.
+  /* verilator lint_off UNUSEDSIGNAL */
+  // R828b: the deepest mip level a span may use -- the level whose smaller
+  // side is 32 texels (translucent) or 16 (opaque), at most 7; see ld_span
+  function automatic logic [2:0] mip_deepest(input logic [2:0] wc, input logic [2:0] hc,
+                                             input logic tr);
+    logic [2:0] c;
+    begin
+      c = (wc < hc) ? wc : hc;
+      mip_deepest = (tr || c == 3'd7) ? c : c + 3'd1;
+    end
+  endfunction
+
+  function automatic logic [19:0] to_tx(input logic signed [31:0] q);
+    to_tx = q[31] ? 20'd0 : q[29:10];      // the fraction below bit 10 is dropped
+  endfunction
+  /* verilator lint_on UNUSEDSIGNAL */
+
+  // R496: A REGISTER, NOT A MUX, IN FRONT OF THE CACHE'S ADDRESS PORT.
+  //
+  // R490 wrote this as `tex_p[fq_p]`, which put a 2:1 select on a path that
+  // had been a plain register read and that lands directly on an M10K address
+  // input inside m2_texel. Twenty-six of the thirty worst clk_mem paths in
+  // s183 were this one:
+  //
+  //   m2_span_tex|tex_p[0][5] -> m2_texel|...|ram_block1a17~portb_address_reg11
+  //                                                              -1.271 ns
+  //
+  // ahead of m2_sdram's `inflight -> state.S_SEL`, which had been the worst
+  // path in every previous build of this design. Eight builds carrying R490
+  // failed to run and this is why: the change made to fix the picture moved
+  // the clock instead.
+  //
+  // The select is resolved when the fetch is ISSUED and held in one register,
+  // so the cache sees exactly what it saw before R490 -- a register.
+
+  // The texel as an intensity: 0x0 -> 0, 0xF -> 0xFF, evenly spaced.
+  // R476: the emit computes its own intensity from the texel that has just
+  // arrived, so there is no registered copy to derive one from.
+  /* verilator lint_off UNUSEDSIGNAL */
+  // R784: a channel of a textured pixel, min(255, A + c * lum / 32), and 0
+  // where the reference's table is 0 (no component, or luma 0). IN TWO
+  // HALVES, because R741 measured a multiply with an add after it at -0.13 /
+  // -0.281 ns into e_col at 80 MHz and fixed it by taking the add away: the
+  // emit registers the bare product (e_pr, as R741's c * (i + 1) did) and the
+  // pedestal, the clamp and the zero are applied on the way OUT, where the
+  // writer's own intake register (m2_fb_wcomb px_r) is the next flop.
+  function automatic logic [7:0] tfin(input logic [13:0] p, input logic z,
+                                      input logic [6:0] a);
+    logic [9:0] q;
+    begin
+      q    = {1'b0, p[13:5]} + {3'd0, a};
+      tfin = z ? 8'd0 : (q[9:8] != 2'd0) ? 8'hff : q[7:0];
+    end
+  endfunction
+  // R784: the texel's luma. m2_texel_bl answers t on a 0..255 scale (a nibble
+  // replicated, x * 17); the reference's is 0..240 (x << 4), so t - t/16 puts
+  // it back exactly for every unfiltered texel and within a step between. The
+  // luma table: Daytona's row 0 is i/2 and row 1 is 63 - i/2 (dumped, MAME
+  // 0.289; rows 2-65 are effects ramps no measured pixel used), so with t >> 1
+  // as the index the luma is t/4 or its complement.
+  // R867: the luma table's index, MAME's t >> 1 with t on its 0..240 scale.
+  function automatic logic [6:0] tidx(input logic [7:0] t);
+    logic [7:0] tm;
+    begin
+      tm   = t - {4'd0, t[7:4]};
+      tidx = tm[7:1];
+    end
+  endfunction
+  function automatic logic [5:0] tlum(input logic [7:0] t, input logic inv);
+    logic [7:0] tm;
+    begin
+      tm   = t - {4'd0, t[7:4]};
+      tlum = inv ? ~tm[7:2] : tm[7:2];
+    end
+  endfunction
+  /* verilator lint_on UNUSEDSIGNAL */
+
+  wire tex_now = in_tex_en && in_tex[0];
+  wire cull;            // R813: the span at the input is dropped (declared with its check below)
+  wire in_vk = in_valid && !cull;
+
+  // R326: THE TRANSLUCENT TEXEL TEST, WHICH IS THE WHOLE OF MAME'S ALPHA.
+  //
+  // model2rd.ipp's fetch_bilinear_texel<Translucent> sets 0x00800000 on every
+  // texel EXCEPT 0xf0, and draw_scanline_tex<Translucent> then does
+  // `if (t < 0x00400000) continue;`. With point sampling that reduces exactly
+  // to: on a translucent polygon a texel of 0xF is transparent and every other
+  // value draws normally. On a NON-translucent polygon 0xF is a legitimate
+  // full-brightness texel and must not be skipped -- which is why this is
+  // gated on the header bit rather than applied to every span.
+  //
+  // Bit 8 of the packed texture word is the translucent flag (see the packing
+  // in m2_geo_engine); it used to be texwrapy, which nothing read.
+  //
+  // Skipping costs nothing but the pixel: the walk advances identically, so a
+  // fully transparent span still terminates on its own x1.
+  //
+  // R620: THE TEST NOW LIVES IN m2_texel_bl, which blends the four texels'
+  // alphas and discards below half, as fetch_bilinear_texel does; its point
+  // mode reduces to the rule above. It arrives here as bit 8 of the answer.
+
+  wire idle    = (st == T_IDLE);
+  // R867: with TEXLUT the textured pixels leave through five more stages
+  // (lp_*); a flat span may pass only once they are empty too.
+  wire lp_busy;
+  wire pass    = idle && !lp_busy;
+  assign busy  = !idle || e_valid || lp_busy;
+
+  // The registered half, used only while a textured span is being walked.
+  logic               e_valid;
+  /* verilator lint_off UNUSEDSIGNAL */   // R867: unused with TEXLUT
+  logic [13:0]        e_pr [3];   // R784: c * lum per channel (R, G, B), the emit's product
+  logic [2:0]         e_z;        // R784: ... and whether the table is 0 there
+  /* verilator lint_on UNUSEDSIGNAL */
+  // THE PIXEL'S OWN x, LATCHED WITH ITS COLOUR. Taking it from the walking
+  // register instead puts every pixel one to the right of where its texel came
+  // from: the walk advances in the same cycle the pixel is offered, so the
+  // combinational read sees the NEXT x.
+  logic signed [15:0] e_x;    // R813: 16 bits
+  // AND THE GROUP'S LAST PIXEL, REGISTERED WITH IT. Computing `min(x + PIXSTEP
+  // - 1, x1)` on the way OUT puts a 32-bit add, a compare and a mux between a
+  // register and the band buffer's write decode -- combinational the whole
+  // way, because a flat span passes through this unit as wires. It is latched
+  // here instead.
+  logic signed [15:0] e_x1;   // R813: 16 bits
+  // R490: the pixel standing at the output is its span's LAST. The span's
+  // parameter set cannot be released until that pixel has been TAKEN, or out_y
+  // and out_moire would switch to the next span's values while the previous
+  // span's final pixel is still being presented.
+  logic               e_last;
+
+  // R867: the output stage of the table path (TEXLUT): the pixel, its span's
+  // y and stipple carried by value (a skipped last texel can free the span's
+  // parameter set while its earlier pixels are still in these stages), and
+  // the three gamma products.
+  /* verilator lint_off UNUSEDSIGNAL */   // read only with TEXLUT
+  logic               lp4_v, lp4_last, lp4_moire;
+  logic signed [15:0] lp4_x, lp4_x1, lp4_y;
+  logic [24:0]        lp4_g [3];
+  /* verilator lint_on UNUSEDSIGNAL */
+  // the downstream handshake the emit sees: the band itself, or (TEXLUT) the
+  // table stages, which all move together whenever their output can.
+  wire lp_adv = !lp4_v || out_ready;
+  wire e_rdy  = TEXLUT ? lp_adv : out_ready;
+  /* verilator lint_off UNUSEDSIGNAL */   // g[15:0], below the result
+  function automatic logic [7:0] gfin(input logic [24:0] g);
+    gfin = (g[24] != 1'b0) ? 8'hff : g[23:16];
+  endfunction
+  /* verilator lint_on UNUSEDSIGNAL */
+
+  // Flat spans go through as wires; textured pixels come from the registers.
+  generate if (TEXLUT) begin : g_out_lut
+    assign out_valid = pass ? (in_vk && !tex_now) : lp4_v;
+    assign out_y     = pass ? in_y     : 32'(lp4_y);
+    assign out_x0    = pass ? in_x0    : 32'(lp4_x);
+    assign out_x1    = pass ? in_x1    : 32'(lp4_x1);
+    assign out_col   = pass ? in_col   : {gfin(lp4_g[0]), gfin(lp4_g[1]), gfin(lp4_g[2])};
+    assign out_moire = pass ? in_moire : lp4_moire;
+  end else begin : g_out_lin
+  assign out_valid = idle ? (in_vk && !tex_now) : e_valid;
+  assign out_y     = idle ? in_y     : 32'(y_p[e_p]);   // R813: sign-extended
+  assign out_x0    = idle ? in_x0    : 32'(e_x);
+  // PIXSTEP wide, clipped at the span's end -- computed when the pixel is
+  // formed, not when it is offered.
+  assign out_x1    = idle ? in_x1 : 32'(e_x1);
+  assign out_col   = idle ? in_col   : {tfin(e_pr[0], e_z[0], ped),   // R784
+                                          tfin(e_pr[1], e_z[1], ped),
+                                          tfin(e_pr[2], e_z[2], ped)};
+  assign out_moire = idle ? in_moire : moire_p[e_p];
+  end endgenerate
+
+  // A flat span is accepted only when the band takes it, which is the handshake
+  // the fill saw before this unit existed. A textured one is accepted at once
+  // and walked from the registers.
+  // R490: a FLAT span still needs the unit truly idle -- passed through as
+  // wires, it would overtake the textured pixels still in the pipeline. Only a
+  // textured one may be accepted on top of a draining span.
+  assign in_ready  = TEXLUT ? ((idle && tex_now) || (pass && out_ready) || ld_over || cull)   // R867
+                            : ((idle && (tex_now || out_ready)) || ld_over || cull);   // R813
+  assign dbg_hot    = st;          // R446: free, no counter behind it
+
+  // R520: THE LONGEST STRETCH THIS UNIT WAS BUSY AND DID NOTHING.
+  //
+  // dbg_hotcyc has been hardwired to zero since it was declared -- its header
+  // describes a longest-dwelt-state counter that was never built, the seventh
+  // dead instrument found in this push. It is already routed to the top level
+  // and onto the UART's Z channel, so the number that actually matters costs
+  // no ports and no bandwidth.
+  //
+  // R490 draws on the board for three to five seconds and then the 3D stops
+  // for good while the CPU and tilemap run on. That is this unit ceasing to
+  // accept: a span that never completes leaves sp_n high, in_ready never
+  // asserts again, the quad store's FIFO backs up and the fill can never
+  // finish another band. Six simulated regimes have failed to reproduce it
+  // (R513, R517, R518), so the board has to say.
+  //
+  // A healthy unit is sometimes busy for a long time -- a texel timeout is 511
+  // cycles and a stalled band adds more -- but it always comes back. The
+  // diagnostic is the MAXIMUM run of cycles spent busy while accepting nothing
+  // and emitting nothing. Hundreds is normal. Saturated is wedged, and the
+  // value survives the event, so one capture after the 3D dies says whether it
+  // was this unit or something upstream of it.
+  logic [15:0] stuck_run;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      stuck_run <= 16'd0; dbg_hotcyc <= 16'd0;
+    end else begin
+      if (!busy || (in_valid && in_ready) || (out_valid && out_ready))
+        stuck_run <= 16'd0;
+      else if (!(&stuck_run))
+        stuck_run <= stuck_run + 16'd1;
+      if (stuck_run > dbg_hotcyc) dbg_hotcyc <= stuck_run;
+    end
+  end
+
+  // R446: the group after this one. Stable for as long as the FSM sits in
+  // T_FETCH/T_EMIT, which is what lets the pipeline below settle on it.
+  // R476: THE PIPELINE CARRIES SUCCESSIVE GROUPS NOW, NOT ONE HELD STILL.
+  //
+  // It used to be fed dv_u/dv_o = u_nxt/ooz_nxt -- the SAME next-group value,
+  // recomputed every cycle while the walk sat on the current one -- and the FSM
+  // waited `dv_age >= 6` for it to settle, then advanced and waited again. A
+  // fixed-latency pipeline fed a constant, so nothing overlapped.
+  //
+  // R475 measured what that costs, with the bench answering every texel in ONE
+  // cycle: **7.41 cycles per group**, which is 45,835 groups x 7.41 x 20 ns =
+  // 6.8 ms of a 16.7 ms frame before any texel latency at all -- twice the
+  // 3.3 ms the misses cost. The divide was the bottleneck, not the fetch, and
+  // it is why R470's 60 MHz renderer bought nothing: a faster clock shortens a
+  // fixed wait proportionally while the crossing it added got longer.
+  //
+  // So an ISSUE pointer walks the span a group per cycle into the pipeline, a
+  // shadow carries each group's x alongside, and the consumer takes results as
+  // they emerge. The divide's six cycles are paid once per SPAN instead of once
+  // per group.
+  logic signed [31:0] iss_u, iss_v, iss_ooz;
+  logic signed [16:0] iss_x;   // R813: 17 bits: x1 + 7 for any 16-bit x1
+  logic               iss_run;      // still issuing groups for this span
+  logic [3:0]         iss_step;     // R650: the issuing span's step, 1-8
+  wire                iss_last  = (iss_x + 17'(iss_step) - 17'sd1) >= 17'(x1_p[sp_iss]);
+
+  wire signed [31:0] dv_o    = iss_ooz;
+  wire signed [31:0] dv_u    = iss_u;
+  wire signed [31:0] dv_v    = iss_v;
+
+  // THE SHADOW. Six deep, matching d0..d4b, so the x that arrives with a
+  // result is the x that was issued with its operands. Getting this depth
+  // wrong pairs a group's coordinates with another group's position, which
+  // draws a span whose texture slides along it -- and every arithmetic check
+  // still passes.
+  localparam int unsigned PIPE_D = 7;   // R718: d0, d1a, d1, d2, d3, d4a, d4
+  localparam int unsigned UVS = 18 - UZF;   // R791: the u/v values' fraction bits
+  logic                    sh_v    [PIPE_D];
+  logic signed [31:0]      sh_x    [PIPE_D];
+  logic                    sh_last [PIPE_D];
+  // R490: WHICH SPAN EACH GROUP BELONGS TO. One pointer cannot serve the whole
+  // tail of this pipeline: the retire stage and the output stage are separate,
+  // so while span A's last pixel is being taken at the output, span B's first
+  // group can already be at the retire stage being coloured. Reading both from
+  // a single sp_out coloured B's groups with A's parameters -- caught by the
+  // back-to-back test as 194 groups carrying the wrong span's y.
+  logic                    sh_p    [PIPE_D];
+
+  logic [2:0]  dv_age;            // kept: the span's first result still warms
+
+  // R476: the result standing at the end of the pipeline, and the fetch slot.
+  wire                res_valid = sh_v[PIPE_D-1];
+  // R607: this group's pixels are all painted already (registered one stage
+  // before the fetch decision, from the mask as it stood a cycle earlier).
+  logic               sh_m;
+  wire                res_skip  = FTB && sh_m;
+  // R633: reuse the texel of the group fetched just before, same span,
+  // adjacent -- tracked at the consumer (cons_take), where fetches are issued
+  logic               lf_v;          // the last group taken was a real fetch
+  logic               lf_p;          // ... of this span slot
+  logic signed [15:0] lf_xn;         // ... whose neighbour is at this x (x + PIXSTEP,
+                                     // added as it is stored: cons_take drives pipe_en)
+  wire                res_reuse;
+
+  // R607: THE MASK COPY AND THE QUERY. One bit a pixel, 32 to a word, a row
+  // of the band in MROW words; m2_raster3d owns the valid bits (cleared as a
+  // band starts) and writes both copies as the band paints. The query is for
+  // the group one stage before the fetch decision. A group that crosses a
+  // 32-pixel word is not skipped -- conservative, and about one in eight at
+  // PIXSTEP 4. Pixels off the screen or outside the band count as painted:
+  // the band would drop them.
+  // no_rw_check: see m2_raster3d mk_a. A stale answer here only costs a fetch.
+  (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] mk [MDEP];
+  always_ff @(posedge clk) if (mk_we) mk[mk_waddr] <= mk_wdata;
+  // R631: THE QUERY IN TWO HALVES (s409: one path through all of it --
+  // clamp, index multiply, the MLAB read, two variable shifts, the compare
+  // -- missed 70 MHz by 66 ps, and a wrong answer skips painting: bands never
+  // drawn on the board). The index, the pixels the group needs and the two
+  // early answers depend only on the group's x and its span, which are in
+  // the shadow a stage sooner and do not change as it shifts, so they are
+  // worked out from sh_*[PIPE_D-3] and registered with the shift; the mask
+  // word is still read at PIPE_D-2, when it was before. Same answers.
+  logic               mq_f1, mq_f0;     // answer "full" / "not full" outright
+  logic [MAW-1:0]     mq_wi;
+  logic [31:0]        mq_need;
+  logic               mp_f1, mp_f0;
+  logic [MAW-1:0]     mp_wi;
+  logic [31:0]        mp_need;
+  // R684: SIXTEEN BITS, not 32. Every value here is a screen x or y -- the
+  // band and the writer already take [15:0] (R553) -- and the 32-bit clamps,
+  // compares and subtracts were most of the +416 LUTs R683's build measured
+  // for this query, on a device 28 LABs short. Taken as bit slices into
+  // signed variables, no casts (R662).
+  localparam logic signed [15:0] QXMAX = 16'(SCR_W - 1);
+  localparam logic signed [15:0] QBH   = 16'(BAND_H);
+  // R739: the group's span parameters, selected from its slot one stage
+  // EARLIER (sh_p[PIPE_D-4]) and registered as it moves to PIPE_D-3, so the
+  // query no longer starts with the slot mux (s787 at 80 MHz: k_p -> mq_f1
+  // -0.280, -> mq_f0). The same values: a slot is not reloaded while a group
+  // of its span is in flight (R490), and these move only with the pipe.
+  logic signed [15:0] q_x1, q_y;
+  logic signed [15:0] q_sm1;   // R742: stp(k) - 1, latched with k (s795: q_k -> mq_f0 -0.236)
+  always_comb begin
+    // R742: the step less one comes latched (q_sm1)
+    automatic logic signed [15:0] qx   = sh_x[PIPE_D-3][15:0];
+    automatic logic signed [15:0] qx1  = q_x1;
+    automatic logic signed [15:0] qy   = q_y;
+    automatic logic signed [15:0] qe   = qx + q_sm1;   // R650: qx + step - 1
+    automatic logic signed [15:0] qxe  = (qe > qx1) ? qx1 : qe;
+    automatic logic signed [15:0] qrow = qy - mk_band_y0;
+    automatic logic signed [15:0] xa   = (qx  < 16'sd0) ? 16'sd0 : qx;
+    automatic logic signed [15:0] xb   = (qxe > QXMAX) ? QXMAX : qxe;
+    mp_wi   = MAW'(qrow) * MAW'(MROW) + MAW'(xa[15:5]);
+    mp_need = (32'hFFFF_FFFF << xa[4:0]) & (32'hFFFF_FFFF >> (5'd31 - xb[4:0]));
+    mp_f1   = (qrow < 16'sd0) || (qrow >= QBH) || (xb < xa);
+    mp_f0   = !mp_f1 && (xa[15:5] != xb[15:5]);
+  end
+  // R813: the span cull's shape (its check is below)
+  localparam int unsigned CG   = 32 / CULLG;         // mask bits a word
+  localparam int unsigned CGW  = $clog2(CG);
+  localparam int unsigned GSH  = $clog2(CULLG);
+  localparam int unsigned BHW  = $clog2(BAND_H);
+  localparam bit          CULL_OK = SPCULL && FTB && ((1 << BHW) == BAND_H) && (MROW == 16);
+  logic mq_full;
+  // R813: THE SPAN CULL (below) READS THIS PORT FIRST. A cycle it reads, the
+  // group at the query's read stage is answered "not full" -- fetched rather
+  // than skipped, which costs a fetch and never a pixel: the writer's own
+  // mask test keeps the picture exact. A check is a word or two a waiting
+  // span, against ~12 groups a hidden span walks. Both addresses and the
+  // select (cs_run) are registers: one LUT before the MLAB's address.
+  // (Its own copy of the mask instead was ~1% faster and +52 ALM standalone.)
+  logic           cs_run;
+  logic [MAW-1:0] cs_wi;                 // the word the cull reads
+  wire            cs_port = CULL_OK && cs_run;
+  wire [MAW-1:0]  mk_ri = cs_port ? cs_wi : mq_wi;
+  wire [31:0]     mk_rw = mk_valid[mk_ri] ? mk[mk_ri] : 32'd0;
+  always_comb begin
+    automatic logic [31:0] w = mk_rw;
+    if (mq_f1)        mq_full = 1'b1;
+    else if (cs_port) mq_full = 1'b0;   // R813: the cull has the port
+    else if (mq_f0)   mq_full = 1'b0;
+    else            mq_full = ((w & mq_need) == mq_need);
+  end
+  // R813: THE SPAN CULL'S CHECK, on the span standing at the input. A span
+  // whose every pixel is already painted this band paints nothing (the
+  // writer's mask test, MAME's `if (fill[x]) continue`), yet it was walked a
+  // group a cycle and held a span slot until its last group had passed the
+  // in-flight queue. Hidden spans were 103k-292k of the 142k-321k skipped
+  // groups a draw (r57, rpk). Now: registered first, the span's first mask
+  // word, how many more it covers and where it starts and ends in them -- bit
+  // slices of its own x0, x1 and y. Then one mask word a cycle, through the
+  // query's port (above): a word not painted wherever the span covers it ends
+  // the check (the span is walked as before); the last word painted too and
+  // the span is taken and dropped. The answer is used only while the same
+  // span still stands (nothing taken since the check began), so a span taken
+  // at once is never delayed -- only one that waits is checked. CULLG pixels
+  // a bit, set only when all of them are painted: conservative, never wrong.
+  logic               cs1_v;                 // the span stood last cycle too
+  logic               cs_done, cs_hid;
+  logic [3:0]         cs_n;                  // words after cs_wi
+  logic               cs_first;
+  logic [CGW-1:0]     cs_a, cs_b;            // first / last bit in the first / last word
+  logic               cs_in;                 // on the screen
+  wire  [CGW-1:0]     cp_a  = CGW'(in_x0[4:0] >> GSH);
+  wire  [CGW-1:0]     cp_b  = CGW'(in_x1[4:0] >> GSH);
+  wire  [3:0]         cp_n  = 4'(in_x1[8:5] - in_x0[8:5]);
+  wire  [MAW-1:0]     cp_wi = MAW'({in_y[BHW-1:0], in_x0[8:5]});   // row * MROW + word
+  // Only x is checked: a span off the left or right edge would read another
+  // word. y is not -- a row outside the band reads some row of this band's
+  // mask, and whichever way that goes nothing is painted: the walk's own
+  // query counts every pixel outside the band as painted (mp_f1).
+  wire                cp_in = !in_x0[15] && (in_x1[15:9] == 7'd0);
+  logic [CG-1:0]      cs_w;
+  always_comb
+    for (int g = 0; g < CG; g++) cs_w[g] = &mk_rw[g * CULLG +: CULLG];
+  wire        in_take = in_valid && in_ready;
+  wire [CG-1:0] cs_need = (cs_first ? ({CG{1'b1}} << cs_a) : {CG{1'b1}})
+                        & ((cs_n == 4'd0) ? ({CG{1'b1}} >> (CGW'(CG - 1) - cs_b)) : {CG{1'b1}});
+  wire        cs_ok   = (cs_w & cs_need) == cs_need;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      cs1_v <= 1'b0; cs_run <= 1'b0; cs_done <= 1'b0; cs_hid <= 1'b0;   // R813
+      cs_wi <= '0; cs_n <= '0; cs_first <= 1'b1; cs_a <= '0; cs_b <= '0; cs_in <= 1'b0;
+    end else begin
+      cs1_v <= in_valid && !in_take;
+      cs_in <= cp_in; cs_a <= cp_a; cs_b <= cp_b;
+      if (!in_valid || in_take) begin
+        cs_run <= 1'b0; cs_done <= 1'b0; cs_hid <= 1'b0;
+      end else if (!cs_run && !cs_done) begin
+        if (cs1_v && CULL_OK) begin          // the same span a second cycle: start
+          cs_wi <= cp_wi; cs_n <= cp_n; cs_first <= 1'b1;
+          if (cs_in) cs_run <= 1'b1;
+          else       cs_done <= 1'b1;        // not culled
+        end
+      end else if (cs_run) begin
+        if (!cs_ok)              begin cs_run <= 1'b0; cs_done <= 1'b1; cs_hid <= 1'b0; end
+        else if (cs_n == 4'd0)   begin cs_run <= 1'b0; cs_done <= 1'b1; cs_hid <= 1'b1; end
+        else begin   // the next word of the same row
+          cs_wi <= {cs_wi[MAW-1:4], cs_wi[3:0] + 4'd1}; cs_n <= cs_n - 4'd1; cs_first <= 1'b0;
+        end
+      end
+    end
+  end
+  assign cull = CULL_OK && cs_done && cs_hid && in_valid;
+
+  /* verilator lint_off UNUSEDSIGNAL */   // R553: only [15:0] is queued
+  wire signed [31:0]  res_x     = sh_x[PIPE_D-1];
+  /* verilator lint_on UNUSEDSIGNAL */
+  wire                res_last  = sh_last[PIPE_D-1];
+  wire                res_p     = sh_p[PIPE_D-1];
+
+  // R539: the fetches in flight, in issue order -- each one's pixel x, its
+  // span's last-group flag and its parameter set. Answers arrive in the same
+  // order, so the head of this queue is always the answer's owner.
+  localparam int unsigned OW = $clog2(TXK) + 1;
+  // R553: 16 bits, not 32 -- screen x, and the band takes span_x0[15:0].
+  // R909: MLAB -- 256 bits Quartus had put in a whole M10K
+  (* ramstyle = "MLAB" *) logic signed [15:0] of_x    [TXK];
+  logic               of_last [TXK];
+  logic               of_p    [TXK];
+  logic               of_skip [TXK];   // R607
+  logic               of_reuse [TXK];  // R633
+  logic [OW-1:0]      of_wp, of_rp;
+  // R478: THE RETIRE STAGE. R476 computed e_col straight from the arriving
+  // texel, which put m2_texel's `hold` register, the nibble select, the
+  // adapter and scale() in ONE cycle:
+  //
+  //   m2_texel|hold[12] -> m2_span_tex|e_col[22]   9.570 ns
+  //
+  // and cost about 0.6 ns of clk_sys across three seeds. The old walk
+  // registered the texel first and coloured it the cycle after; streaming the
+  // walk removed that stage by accident. Putting it back costs a stage but not
+  // a cycle per group, because the next fetch is issued on the same edge.
+  logic               rt_valid;
+  logic               rt_texel;    // R784: the discard bit only (R620 held {discard, t})
+  logic signed [15:0] rt_x;   // R813: 16 bits
+  logic               rt_last;
+  logic               rt_p, e_p;   // R490
+  logic               rt_skip;     // R607
+  // R731: the retiring group's span parameters, taken from its slot as the
+  // group ENTERS the retire stage rather than through rt_p as it leaves. At
+  // 80 MHz rt_p -> the slot select -> scale's multiply -> e_col was the path
+  // (s759: 0.493 ns at 75, 12 endpoints; rt_p -> e_x1 0.845, 16). The same
+  // values: a slot is not reloaded while a group of its span is in flight
+  // (R490), which the emit-time read below always relied on.
+  logic [23:0]        rt_col;
+  logic [5:0]         rt_lum;  // R784: the texel's luma, 0..63 (was R741's rt_i1)
+  /* verilator lint_off UNUSEDSIGNAL */   // R867: TEXLUT reads rt_idx; R784's path ped, e_pr, e_z
+  logic [6:0]         rt_idx;  // R867: the luma table's index, t >> 1 on the reference's scale
+  /* verilator lint_on UNUSEDSIGNAL */
+  /* verilator lint_off UNUSEDSIGNAL */   // R867: unused with TEXLUT
+  logic [6:0]         ped;     // R784: the output curve's pedestal, from gamma_sel
+  /* verilator lint_on UNUSEDSIGNAL */
+  logic [1:0]         rt_k;
+  logic signed [15:0] rt_x1;  // R813: 16 bits
+  logic [8:0]         lt_texel;    // R633: the last fetched answer, for a reuse
+
+  // Take a result when there is one, no fetch is outstanding, and the emit
+  // slot will be free. The pipeline runs whenever the output is not being held.
+  // The span load, seen by the pipeline block so the issue pointer starts with
+  // the span. The FSM loads du_r/dv_r/doz_r on the same edge; the first advance
+  // happens a cycle later, by which time they are valid.
+  // R490: a span is accepted COLD (nothing in flight) or OVERLAPPED (the
+  // current span has issued its last group and there is a free parameter set).
+  // The overlap case must NOT clear the shadow -- the valids in it belong to
+  // the span still draining and are wanted.
+  wire sp_room   = (sp_n < 2'd2);
+  wire ld_cold   = (st == T_IDLE) && in_vk && tex_now;
+  wire ld_over   = (st == T_RUN) && in_vk && tex_now && !iss_run && sp_room
+                && pipe_en;
+  wire ld_span   = ld_cold || ld_over;
+  // R616: (PIXSTEP-1)/2 pixels of each gradient, 16.16 (gradients are 8.8).
+  // R650: x (2^pxk - 1) as a shift and a subtract.
+  wire signed [31:0] gc_du = GC ? (((32'(in_dudx)   <<< pxk) - 32'(in_dudx))   <<< (UVS - 9)) : 32'sd0;   // R791
+  wire signed [31:0] gc_dv = GC ? (((32'(in_dvdx)   <<< pxk) - 32'(in_dvdx))   <<< (UVS - 9)) : 32'sd0;
+  wire signed [31:0] gc_do = GC ? (((32'(in_doozdx) <<< pxk) - 32'(in_doozdx)) <<< 7) : 32'sd0;
+  // R478: the retire slot only has to be free by the NEXT edge, not this one.
+  // Requiring !rt_valid outright cost a whole cycle a group (2.36 -> 3.36):
+  // the emit that frees it happens on the same edge the fetch would start.
+  wire rt_frees  = rt_valid && (!e_valid || e_rdy);   // R867: e_rdy
+  // R539: a result is issued as a fetch whenever a credit is free -- no longer
+  // only when the previous fetch has come back. The retire slot is not
+  // reserved here; the answer waits in the adapter until it is free.
+  wire of_room   = ((of_wp - of_rp) != OW'(TXK));
+  // R607: a skipped group takes a queue slot but no credit and no fetch, and
+  // leaves the queue without an answer once it is at the head -- the answers
+  // still come back in the order the real fetches were made.
+  assign res_reuse = REUSE && late && !res_skip && lf_v && (lf_p == res_p)
+                  && (lf_xn == res_x[15:0]);
+  wire cons_take = res_valid && (res_skip || res_reuse || tx_rdy) && of_room && (st == T_RUN);
+  wire head_skip = of_skip[of_rp[OW-2:0]];
+  wire head_reuse = of_reuse[of_rp[OW-2:0]];   // R633
+  // An answer moves into the retire stage when that stage is empty or
+  // emptying this cycle.
+  wire rt_take   = (head_skip || head_reuse || tx_ack) && (of_wp != of_rp) && (!rt_valid || rt_frees)
+                && (st == T_RUN);
+  assign tx_take = rt_take && !head_skip && !head_reuse;   // R607, R633
+  // R551: WHY THE WALK IS BUSY, for the bench only (nothing reads it, so the
+  // fitter drops it). 1 the band painter is not taking the emitted group,
+  // 2 fetches are out and the oldest has not been answered, 3 a result is
+  // ready but no fetch credit is free, 4 the divide pipeline has nothing ready
+  // (span start / refill), 0 not busy.
+  logic [2:0] wait_why /*verilator public_flat_rd*/;
+  assign dbg_wait = wait_why;
+  always_comb begin
+    wait_why = 3'd0;
+    if (busy) begin
+      if (TEXLUT ? (lp4_v && !out_ready) : (e_valid && !out_ready)) wait_why = 3'd1;   // R867
+      else if ((of_wp != of_rp) && !tx_ack && !head_skip && !head_reuse) wait_why = 3'd2;
+      else if (res_valid && !tx_rdy)                    wait_why = 3'd3;
+      else if (!res_valid)                              wait_why = 3'd4;
+    end
+  end
+  wire pipe_en   = !res_valid || cons_take;
+  logic signed [31:0] d0_o;   logic [5:0] d0_e;   // R448: stage 1a
+  logic [5:0]  d1_e;   logic [31:0] d1_m;  logic [24:0] d1_r;
+  logic [5:0]  d1a_e;  logic [31:0] d1a_m;   // R718: stage 1b's shift, before the table
+  logic [31:0] d2_nd;  logic [5:0]  d2_e;  logic [24:0] d2_r;
+  logic [24:0] d3_r1;  logic [5:0]  d3_e;
+  logic signed [31:0] d4_u, d4_v;
+  logic        [63:0] d4a_pu, d4a_pv;   // R468: the product, before the shift
+  logic               d4a_nu, d4a_nv;   // R955: u/z, v/z negative (the product is)
+  logic         [4:0] d4a_sh;
+  // R828: the group's mip level, chosen as it enters d1 and carried down the
+  // divide beside it; d4a_sr is the un-normalising shift past the first 18
+  // (always at least 18) plus the level: 0..15
+  logic         [2:0] d1_L, d2_L, d3_L, d4a_L, d4_L;
+  logic         [3:0] d4a_sr;
+  // R940: the span's uvs beside the level, d1 .. d3; d4a_ur is the
+  // un-normalising shift past a fixed 16, less it: 2 + d4a_sr - s with MIP
+  // (0..17), d4a_sh - 16 - s without (0..10). One shift, so nothing below the
+  // binary point is lost first; with s = 0 it is exactly the shift below.
+  logic         [1:0] d1_S, d2_S, d3_S;
+  logic         [4:0] d4a_ur;
+  wire          [3:0] d3_sr = ((d3_e < 6'd23) ? 4'd0 : 4'(d3_e - 6'd23)) + 4'(d3_L);   // d4a_sr's next value
+  wire          [4:0] d3_sh = (d3_e < 6'd23) ? 5'd18 : 5'(d3_e - 6'd5);               // d4a_sh's next value
+  /* verilator lint_off UNUSEDSIGNAL */
+  wire signed  [10:0] mp_l4 = 11'(mipk_p[sh_p[1]]) - 11'({1'b0, d1a_e, d1a_m[22:21], 1'b0});
+  /* verilator lint_on UNUSEDSIGNAL */
+  wire          [2:0] mp_ml = mipl_p[sh_p[1]];
+  wire          [2:0] mp_L  = !MIP || mp_l4[10]          ? 3'd0
+                            : (mp_l4[9:2] > 8'(mp_ml))   ? mp_ml
+                            : mp_l4[4:2];
+  // The coordinate that entered the pipeline with the 1/z now emerging from it,
+  // delayed three cycles to match. Getting this wrong pairs a texel coordinate
+  // with the wrong pixel's depth, which is the whole fault this change exists
+  // to avoid introducing.
+  logic signed [31:0] u_h1, v_h1, u_h2, v_h2, u_h3, v_h3, u_h4, v_h4, u_h5, v_h5;
+
+  // R539: the register R496 asked for now lives in m2_texel_x2, which loads
+  // each request into f_tex/f_u/f_v before the cache's adders see it. Here the
+  // payload goes straight into the adapter's request queue with the issue.
+  // R828: WITH MIP the request carries what m2_texel_bl would otherwise work
+  // out on clk_mem: the level (26:24), the sheet already texsheet[L & 1]
+  // (bit 12), and each axis's mirror decision (27 u, 28 v) -- the
+  // coordinate's bit at the level's width, (u >> L) & ((w >> L) << 8) in
+  // model2rd.ipp, i.e. bit 13 + code - L of the level's u. A 4096-wide
+  // texture's bit is 20, past the coordinate: never mirrored, as before.
+  //
+  // R995: THE SLOT'S TEXTURE WORD, ITS MIRROR-BIT INDEXES AND THE BOX
+  // QUEUE'S ADDRESS COME FROM REGISTERS, loaded as the group moves from d4a
+  // to d4 (sh_p[PIPE_D-2]), not through res_p's slot select. s1771 at
+  // 80 MHz: m2_span_tex|sh_p[6] -> the slot select -> mt_bu's add -> the
+  // 32:1 bit select -> mt_fu -> m2_texel_cdc's q_tex datain, -0.108 ns, the
+  // same select also heading ub_ra into the box MLAB (ubi_p -> q_tex, +0.053).
+  // The same values, cycle for cycle: tex_p and ubi_p are written only by a
+  // span load, a load writes the slot no group in flight belongs to (R490;
+  // the argument R731 and R739 rest on -- ld_over writes ~sp_iss with at most
+  // one span live, the issuing one; ld_cold only with nothing in flight and
+  // the shadow cleared), so the slot a group's copies were loaded from is not
+  // written until the group has left d4 -- stalled there or not. d4_L is
+  // loaded from d4a_L on the same edge, so the index uses the same level.
+  // Checked every cycle by M2_R995_CHECK (below) on the benches.
+  logic [23:0] mt_t;
+  logic [4:0]  mt_bu, mt_bv;
+  wire  [23:0] mt_tn = tex_p[sh_p[PIPE_D-2]];
+  wire [31:0] mt_u  = {12'd0, tx_u};   // 32 wide: every 5-bit index is in range (R807)
+  wire [31:0] mt_v  = {12'd0, tx_v};
+  wire        mt_fu = mt_t[9]  && mt_u[mt_bu];
+  wire        mt_fv = mt_t[10] && mt_v[mt_bv];
+  assign tx_tex = MIP ? {3'd0, mt_fv, mt_fu, d4_L, mt_t[23:13], mt_t[12] ^ d4_L[0], mt_t[11:0]}
+                      : {8'd0, mt_t};
+  // R339: the DIVIDED coordinates, not u/z and v/z themselves.
+  // R951: AND KEPT INSIDE THE QUAD'S OWN TEXELS. Every pixel the fill covers
+  // is inside the quad, so in exact arithmetic its u and v lie in the box of
+  // the corners'; the plane fit's quantisation puts a pixel a hair inside an
+  // edge a few 1/256 texel outside it, where the bilinear's other row or
+  // column (point sampling: the nearest) is a texel the polygon never shows
+  // -- Rally's white sky dots, the band's texel 127 over its transparent 128.
+  // A coordinate in the texel just under the box's floor, or exactly on it,
+  // goes to floor + 1/256 (the alpha test then sees what an exact one a hair
+  // inside sees: under half); one in the texel just over its top (ceil, whole
+  // texels) to top - 1/256. ONLY THE NEAR MISS: a coordinate further out is a
+  // fit gone wrong, not a rounding (a saturated divide at a quad's far edge),
+  // and moved to the box's edge it paints a texel of the polygon's where MAME
+  // shows what is behind -- it is left as it was (two subtracts and small
+  // compares, no magnitude compare across the coordinate). Level 0 only: a
+  // level's box would need the bounds shifted per group, and the dots are all
+  // on near, magnified polygons (the 2A no-mip quads: VF2's conifers too).
+  // Whole texels: a box edge the game draws is a whole texel; a clipped
+  // corner's fraction only loosens it. TIMING: ub_ra -> m2_raster3d's MLAB
+  // (an asynchronous read) -> the two subtracts -> the select -> m2_texel_x2's
+  // request registers, on clk_sys -- the fit's report is the check.
+  // R995: THE DIFFERENCES AS EQUALITIES. dl == 1 is lo == ti + 1 and dh == 1
+  // is hm == ti - 1, both mod 2^13 exactly as the subtracts were, so the
+  // carry chains are on ti -- d4_u, a register, beside the MLAB's read --
+  // and the box's own bits meet only an equality compare.
+  function automatic logic [19:0] uv_cl(input logic [19:0] t, input logic [10:0] lo, input logic [10:0] hm);
+    logic [12:0] ti, tp, tm;      // 13 bits: a difference never wraps onto 0 or 1
+    begin
+      ti = 13'(t[19:8]);
+      tp = ti + 13'd1;
+      tm = ti - 13'd1;
+      if ((13'(lo) == tp) || ((13'(lo) == ti) && (t[7:0] == 8'd0)))   // t in the texel under lo, or on it
+        uv_cl = {1'b0, lo, 8'h01};
+      else if (13'(hm) == tm)     // t in the texel over hm
+        uv_cl = {1'b0, hm, 8'hFF};
+      else
+        uv_cl = t;
+    end
+  endfunction
+  // R995: ub_ra is a register, ubi_p[sh_p[PIPE_D-2]] loaded with mt_t (above)
+  wire [44:0] ub_r  = ub_rd;
+  wire        ub_on = UVCL && !ub_r[44] && (!MIP || (d4_L == 3'd0));
+  assign tx_u   = ub_on ? uv_cl(to_tx(d4_u), ub_r[43:33], ub_r[32:22]) : to_tx(d4_u);
+  assign tx_v   = ub_on ? uv_cl(to_tx(d4_v), ub_r[21:11], ub_r[10:0])  : to_tx(d4_v);
+  assign tx_req = cons_take && !res_skip && !res_reuse;   // R607, R633
+  // R615: THE 3D FRAME DIFFERENTIAL'S PROBE -- every real fetch, with the
+  // pixel group and texture it is for. Read by tb_m2_raster3d through
+  // the simulator's public access; nothing in the design reads it, so synthesis
+  // removes it.
+  logic               dbg_fetch   /*verilator public_flat_rd*/;
+  logic signed [31:0] dbg_fetch_x /*verilator public_flat_rd*/;
+  logic signed [31:0] dbg_fetch_y /*verilator public_flat_rd*/;
+  logic        [19:0] dbg_fetch_u /*verilator public_flat_rd*/;
+  logic        [19:0] dbg_fetch_v /*verilator public_flat_rd*/;
+  logic        [26:0] dbg_fetch_t /*verilator public_flat_rd*/;   // R828: {level, texture}
+  logic        [23:0] dbg_fetch_c /*verilator public_flat_rd*/;
+  assign dbg_fetch   = tx_req;
+  assign dbg_fetch_x = res_x;
+  assign dbg_fetch_y = 32'(y_p[res_p]);
+  assign dbg_fetch_u = tx_u;
+  assign dbg_fetch_v = tx_v;
+  assign dbg_fetch_t = {MIP ? d4_L : 3'd0, tex_p[res_p]};
+`ifdef M2_R995_CHECK
+  // R995's registers against the slot selects they replace, every cycle a
+  // result stands at the end of the pipeline
+  always_ff @(posedge clk)
+    if (res_valid && (st == T_RUN)
+        && ((mt_t != tex_p[res_p]) || (ub_ra != ubi_p[res_p])
+            || (mt_bu != 5'd13 + {2'd0, tex_p[res_p][3:1]} - {2'd0, d4_L})
+            || (mt_bv != 5'd13 + {2'd0, tex_p[res_p][6:4]} - {2'd0, d4_L}))) begin
+      $display("R995 CHECK FAILED: slot %0d mt_t %h tex_p %h ub_ra %0d ubi_p %0d", res_p, mt_t, tex_p[res_p], ub_ra, ubi_p[res_p]);
+      $stop;
+    end
+`endif
+  assign dbg_fetch_c = col_p[res_p];
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      d0_o <= '0; d0_e <= '0;
+      d1_e <= '0; d1_m <= '0; d1_r <= '0; d1a_e <= '0; d1a_m <= '0;
+      d2_nd <= '0; d2_e <= '0; d2_r <= '0;
+      d3_r1 <= '0; d3_e <= '0; d4_u <= '0; d4_v <= '0;
+      d4a_pu <= '0; d4a_pv <= '0; d4a_sh <= '0;   // R468
+      d4a_nu <= 1'b0; d4a_nv <= 1'b0;             // R955
+      d1_L <= '0; d2_L <= '0; d3_L <= '0; d4a_L <= '0; d4_L <= '0; d4a_sr <= '0;   // R828
+      d1_S <= '0; d2_S <= '0; d3_S <= '0; d4a_ur <= '0;                            // R940
+      u_h1 <= '0; v_h1 <= '0; u_h2 <= '0; v_h2 <= '0; u_h3 <= '0; v_h3 <= '0;
+      u_h4 <= '0; v_h4 <= '0; u_h5 <= '0; v_h5 <= '0; sh_m <= 1'b0;   // R607
+      mq_f1 <= 1'b0; mq_f0 <= 1'b1; mq_wi <= '0; mq_need <= '0;   // R631
+      q_x1 <= '0; q_y <= '0; q_sm1 <= '0;                           // R739, R742
+      mt_t <= '0; mt_bu <= '0; mt_bv <= '0; ub_ra <= '0;            // R995
+      iss_u <= '0; iss_v <= '0; iss_ooz <= '0; iss_x <= '0; iss_run <= 1'b0; iss_step <= 4'd1;
+      for (int k = 0; k < PIPE_D; k++) begin
+        sh_v[k] <= 1'b0; sh_x[k] <= '0; sh_last[k] <= 1'b0; sh_p[k] <= 1'b0;
+      end
+    end else if (ld_cold) begin
+      // R476: START OF SPAN. On a COLD start the shadow is cleared so a stale
+      // valid from the previous span cannot emerge as a group of this one --
+      // which would draw one span's texel at another span's x and pass every
+      // arithmetic check.
+      //
+      // R490: ON AN OVERLAPPED START IT MUST NOT BE. The valids standing in the
+      // shadow then belong to the span still draining, and clearing them is
+      // exactly the fault the R476 comment describes, in the other direction --
+      // the previous span would lose its remaining groups. Order is preserved
+      // by the pipeline and each span's end is marked by sh_last, so the two
+      // spans' groups coexist without a per-stage tag.
+      iss_u   <= in_u   + gc_du;     // R616
+      iss_v   <= in_v   + gc_dv;
+      iss_ooz <= in_ooz + gc_do;
+      iss_x   <= 17'(in_x0);
+      iss_step <= 4'd1 << pxk;       // R650
+      iss_run <= 1'b1;
+      if (ld_cold) begin
+        for (int k = 0; k < PIPE_D; k++) begin
+          sh_v[k] <= 1'b0; sh_x[k] <= '0; sh_last[k] <= 1'b0; sh_p[k] <= 1'b0;
+        end
+        sh_m <= 1'b0;   // R607
+        mq_f1 <= 1'b0; mq_f0 <= 1'b1; mq_wi <= '0; mq_need <= '0;   // R631
+      end
+    end else if (pipe_en) begin
+      // R476: THE WHOLE PIPELINE STALLS TOGETHER. When the consumer cannot take
+      // the result at the output, nothing moves -- issue, stages and shadow all
+      // hold. Letting the stages advance while the output is held would drop
+      // the result that is standing there.
+      //
+      // Issue one group per enabled cycle, and shift the shadow with it.
+      // R490: AN OVERLAPPED LOAD HAPPENS HERE, NOT IN A BRANCH OF ITS OWN.
+      // Taking a separate branch for it skipped the shadow shift below while
+      // the FSM block -- a different always_ff -- went on consuming the result
+      // standing at the pipeline's output. The two desynchronised and the same
+      // group emerged twice, which the back-to-back test caught as 294 groups
+      // where 289 were sent. A load may only be accepted on a cycle the
+      // pipeline is moving, which is why ld_over carries `pipe_en`.
+      if (ld_over) begin
+        iss_u   <= in_u   + gc_du;   // R616
+        iss_v   <= in_v   + gc_dv;
+        iss_ooz <= in_ooz + gc_do;
+        iss_x   <= 17'(in_x0);
+        iss_step <= 4'd1 << pxk;     // R650
+        iss_run <= 1'b1;
+      end else if (iss_run) begin
+        // R650: du_r/dv_r/doz_r are the per-GROUP steps, shifted by the
+        // span's pxk as they were loaded, so this add has nothing in front
+        iss_u   <= iss_u   + du_r;
+        iss_v   <= iss_v   + dv_r;
+        iss_ooz <= iss_ooz + doz_r;
+        iss_x   <= iss_x   + 17'(iss_step);
+        if (iss_last) iss_run <= 1'b0;
+      end
+      // R739: for PIPE_D-3, a stage early
+      q_sm1 <= 16'(stp(k_p[sh_p[PIPE_D-4]]) - 32'sd1);   // R742
+      q_x1 <= x1_p[sh_p[PIPE_D-4]][15:0];
+      q_y  <= y_p [sh_p[PIPE_D-4]][15:0];
+      // R995: for PIPE_D-1, a stage early, beside d4_L <= d4a_L
+      mt_t  <= mt_tn;
+      mt_bu <= 5'd13 + {2'd0, mt_tn[3:1]} - {2'd0, d4a_L};
+      mt_bv <= 5'd13 + {2'd0, mt_tn[6:4]} - {2'd0, d4a_L};
+      ub_ra <= ubi_p[sh_p[PIPE_D-2]];
+      sh_v[0]    <= iss_run;
+      sh_x[0]    <= 32'(iss_x);
+      sh_last[0] <= iss_run && iss_last;
+      sh_p[0]    <= sp_iss;                 // R490
+      sh_m       <= mq_full;                // R607: follows sh_*[PIPE_D-1]
+      mq_f1 <= mp_f1; mq_f0 <= mp_f0; mq_wi <= mp_wi; mq_need <= mp_need;   // R631
+      for (int k = 1; k < PIPE_D; k++) begin
+        sh_v[k]    <= sh_v[k-1];
+        sh_x[k]    <= sh_x[k-1];
+        sh_last[k] <= sh_last[k-1];
+        sh_p[k]    <= sh_p[k-1];            // R490
+      end
+
+      // R448: STAGE 1 SPLIT IN TWO. As one cycle it was the ooz_nxt add, then
+      // top_bit's priority encode, then a variable shift, then the rcp_tab
+      // read -- four operations, and report_timing named it:
+      //   m2_span_tex|doz_r[17] -> m2_span_tex|d1_r[19]   -0.905 on clk_sys
+      // A four-stage pipeline with four things in its first stage, written to
+      // take a divide OUT of a critical path.
+      //
+      // 1a: the add and the encode. 1b: the shift and the table read.
+      d0_o <= dv_o;
+      d0_e <= top_bit(dv_o);
+      // R718: 1b SPLIT AGAIN -- the variable shift, then the table read. At
+      // 75 MHz the shift into rcp_tab missed (s738: d0_o -> d1_r -0.653).
+      d1a_e <= d0_e;
+      d1a_m <= (d0_e >= 6'd23) ? (d0_o >> (d0_e - 6'd23))
+                               : (d0_o << (6'd23 - d0_e));
+      d1_e <= d1a_e; d1_m <= d1a_m; d1_r <= rcp_tab[d1a_m[22:16]];
+      d1_L <= mp_L;  d2_L <= d1_L;  d3_L <= d2_L;  d4a_L <= d3_L;  d4_L <= d4a_L;   // R828
+      d1_S <= uvs_p[sh_p[1]];  d2_S <= d1_S;  d3_S <= d2_S;                        // R940
+      // stage 2: the Newton residual
+      d2_nd <= 32'((((64'd1 <<< 48) - (64'(d1_m) * 64'(d1_r))) >> 24));
+      d2_e  <= d1_e; d2_r <= d1_r;
+      // stage 3: the refined reciprocal
+      d3_r1 <= 25'((64'(d2_r) * 64'(d2_nd)) >> 23);
+      d3_e  <= d2_e;
+      // stage 4a: the coordinate multiply. R468: THE SHIFT MOVED OFF IT.
+      //
+      //   m2_span_tex|Mult1~mult_hh_pl -> m2_span_tex|d4_v[26]   16.933 ns
+      //
+      // was the worst clk_3d path on s134 once R466 moved m2_persp_recip off
+      // it. One cycle carried a 64-bit multiply, a VARIABLE shift by sh and
+      // then sat32 -- a DSP output straight into a barrel shifter, the same
+      // shape R457, R459, R461 and R466 each split.
+      //
+      // `sh` is not the offender: it comes off the registered d3_e and
+      // computes beside the multiply. The multiply feeding the shifter is.
+      //
+      // COSTS LATENCY, NOT THROUGHPUT. d0..d4 is a pipeline (R446/R448), not a
+      // state walk -- group N+1's coordinates are computed while group N's
+      // texel is in flight -- so one more stage means dv_age reaches six
+      // instead of five, and nothing issues any slower.
+      d4a_pu <= 64'(u_h5) * 64'(d3_r1);   // R718: one deeper, to match
+      d4a_pv <= 64'(v_h5) * 64'(d3_r1);
+      // R955: the product is formed unsigned (d3_r1 is), so a NEGATIVE u/z --
+      // a pixel a hair inside an edge where the coordinate is 0, the plane
+      // fit's quantisation putting it a few 1/256 texel under -- comes out of
+      // the logical shift below as an enormous positive number and sat32 made
+      // it 0x7FFFFFFF: texel 4095.996, which at a no-wrap edge is the
+      // texture's LAST column (MAME's own rule for u just under 0, model2rd
+      // fetch_bilinear_texel). VF2's conifers run u 0 at the quad's top to
+      // ~229 at the trunk, and column 255 is trunk: a trunk texel on the top
+      // edge, above the canopy, where the edge crosses the tree's axis. And
+      // R951's near-miss clamp never saw it -- 4095 is not "the texel under
+      // 0". The sign is u/z's (the reciprocal is positive): a negative one
+      // becomes 0, which to_tx and the clamp were written to expect.
+      d4a_nu <= NEGZ && u_h5[31];
+      d4a_nv <= NEGZ && v_h5[31];
+      // R791: u/z is times 2^18 now, not 2^16 -- two more, so the answer is
+      // still 16.16 quarter-texels. 18..26, inside the five bits.
+      d4a_sh <= d3_sh;
+      d4a_sr <= d3_sr;   // R828
+      // R940: never negative -- s is at most 2, the MIP shift at least 18 and
+      // the other at least 18
+      d4a_ur <= MIP ? 5'(5'd2 + 5'(d3_sr) - 5'(d3_S)) : 5'(d3_sh - 5'd16 - 5'(d3_S));
+
+      // stage 4b: the un-normalise and the clamp, on the registered product.
+      // R828: with MIP the same shift as 18 and then the rest, plus the level
+      // R940: with UVSH 16 and then d4a_ur, which is the same as below
+      // whenever the span's uvs is 0
+      if (UVSH) begin
+        d4_u <= d4a_nu ? 32'sd0 : sat32((d4a_pu >> 16) >> d4a_ur);   // R955
+        d4_v <= d4a_nv ? 32'sd0 : sat32((d4a_pv >> 16) >> d4a_ur);
+      end else begin
+        d4_u <= d4a_nu ? 32'sd0 : MIP ? sat32((d4a_pu >> 18) >> d4a_sr) : sat32(d4a_pu >> d4a_sh);
+        d4_v <= d4a_nv ? 32'sd0 : MIP ? sat32((d4a_pv >> 18) >> d4a_sr) : sat32(d4a_pv >> d4a_sh);
+      end
+      u_h1 <= dv_u;  v_h1 <= dv_v;
+      u_h2 <= u_h1;  v_h2 <= v_h1;
+      u_h3 <= u_h2;  v_h3 <= v_h2;
+      u_h4 <= u_h3;  v_h4 <= v_h3;   // R448: one deeper, to match
+      u_h5 <= u_h4;  v_h5 <= v_h4;   // R718: and one more
+    end
+  end
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      st <= T_IDLE; dv_age <= 3'd0; of_wp <= '0; of_rp <= '0;   // R539
+      rt_valid <= 1'b0; rt_texel <= 1'b0; rt_x <= '0; rt_last <= 1'b0;   // R478
+      rt_lum <= 6'd0; ped <= 7'd0;                                      // R784
+      rt_idx <= 7'd0;                                                   // R867
+      for (int k = 0; k < 2; k++) begin
+        y_p[k] <= '0; x1_p[k] <= '0; col_p[k] <= '0; k_p[k] <= '0;
+        moire_p[k] <= 1'b0; tex_p[k] <= '0;
+        mipk_p[k] <= '0; mipl_p[k] <= '0;   // R828
+        uvs_p[k] <= '0;                     // R940
+        ubi_p[k] <= '0;                     // R951
+      end
+      sp_iss <= 1'b0; sp_out <= 1'b0; sp_n <= 2'd0; e_last <= 1'b0;   // R490
+      rt_p <= 1'b0; e_p <= 1'b0; rt_skip <= 1'b0;                     // R490, R607
+      rt_col <= '0; rt_k <= 2'd0; rt_x1 <= '0;                        // R731
+      lf_v <= 1'b0; lf_p <= 1'b0; lf_xn <= '0; lt_texel <= 9'd0;      // R633
+      du_r <= '0; dv_r <= '0;
+      doz_r <= '0;
+      // R433
+      e_valid <= 1'b0; e_x <= '0; e_x1 <= '0;
+      for (int k = 0; k < 3; k++) e_pr[k] <= '0;
+      e_z <= '0;   // R784
+      dbg_texpix <= '0; dbg_texnz <= '0;
+    end else begin
+      if (e_valid && e_rdy) e_valid <= 1'b0;   // R867: e_rdy
+      // R784: Off keeps the table's pedestal (64), Mild its own curve's
+      // (32 x 1.14 = 37); MAME's curve removes it. Registered, so tfin's
+      // add reads a flop.
+      ped <= gamma_sel[1] ? 7'd64 : gamma_sel[0] ? 7'd37 : 7'd0;
+
+      // R490: A SPAN IS FINISHED when its last pixel has been taken -- or, if
+      // that pixel was a transparent texel the emit skipped, at the skip. The
+      // skip case is easy to miss: e_valid is never raised for it, so waiting
+      // on out_ready alone would strand the parameter set and wedge the unit
+      // behind a span that had already ended.
+      //
+      // R535: AND BOTH CAN HAPPEN ON THE SAME EDGE. Span A's last pixel is taken
+      // at the output while span B -- one group wide, translucent, texel 0xF --
+      // is skipped at the retire stage behind it. Two spans end; the old single
+      // `span_done` counted one, sp_n stayed a span too high for good, the unit
+      // never returned to T_IDLE, and a flat span (accepted only when idle) then
+      // waited forever. That is the wedge R520 caught on the board the first
+      // time an R490 build booted (s239, walk_stuck_max 0xFFFF). Narrow
+      // translucent edges are common in a real scene and absent from every
+      // bench until the soak sent them.
+      begin
+        // R867: with TEXLUT a pixel is finished at the table stages' output
+        automatic logic done_e  = TEXLUT ? (lp4_v && out_ready && lp4_last)
+                                         : (e_valid && out_ready && e_last);
+        automatic logic done_rt = rt_valid && (!e_valid || e_rdy) && rt_last
+                                  && (rt_skip || rt_texel);   // R607, R620
+        automatic logic [2:0] n_next = 3'(sp_n) + 3'(ld_span)
+                                     - 3'(done_e) - 3'(done_rt);
+        automatic logic slot = ld_cold ? sp_out : ~sp_iss;
+
+        if (done_e ^ done_rt) sp_out <= ~sp_out;   // both: two steps, same slot
+        if (ld_span) begin
+          y_p[slot]     <= in_y[15:0];
+          x1_p[slot]    <= in_x1[15:0];
+          col_p[slot]   <= in_col;
+          moire_p[slot] <= in_moire;
+          tex_p[slot]   <= in_tex;
+          // R828: the bias, and the deepest level.
+          // R828b: NOT DOWN TO 2x2. The game's small levels are not faithful
+          // copies: a translucent texture's 4- and 2-texel levels are box
+          // averages that count the transparent nibble (0xF) as a colour, so
+          // a fence or a window frame turns into a solid light panel there
+          // (Ben, s1068: "the guard rails are just flat white textures"), and
+          // some small textures' levels are blank or another picture. MAME
+          // never shows it because the game's texlod keeps those polygons at
+          // level 0, and this walk has no texlod. Measured over every texture
+          // in the M2MIP dumps (study R828b): no level whose smaller side is
+          // 32 texels or more (translucent) or 16 or more (opaque) loses its
+          // transparency or its picture. With c the smaller size code (side
+          // 32 << c): translucent (in_tex[8]) c, opaque c + 1, at most 7.
+          mipk_p[slot]  <= in_mipk;
+          mipl_p[slot]  <= mip_deepest(in_tex[3:1], in_tex[6:4], in_tex[8]);
+          uvs_p[slot]   <= in_uvs;   // R940
+          ubi_p[slot]   <= in_ubi;  // R951
+          du_r          <= (32'(in_dudx)   <<< (UVS - 8)) <<< pxk;   // R650: a group's step; R791
+          dv_r          <= (32'(in_dvdx)   <<< (UVS - 8)) <<< pxk;
+          doz_r         <= (32'(in_doozdx) <<< 8) <<< pxk;
+          k_p[slot]     <= pxk;
+          sp_iss        <= slot;
+        end
+        sp_n <= n_next[1:0];
+        // Back to passing flat spans through only when nothing is left.
+        if ((done_e || done_rt) && (n_next == 3'd0)) st <= T_IDLE;
+      end
+      // R446: the pipeline is four deep; this says when its output matches the
+      // operands currently presented. It must NOT be gated by the branch that
+      // waits on it -- R424 made that mistake and deadlocked the walk.
+      if (dv_age != 3'd7) dv_age <= dv_age + 3'd1;
+
+      case (st)
+        T_IDLE: if (ld_cold) begin
+          dv_age  <= 3'd0;
+          st      <= T_RUN;
+        end
+
+        // R476: ONE STATE, NOT THREE. T_WARM waited for the first divide,
+        // T_FETCH waited for a texel and T_EMIT waited for dv_age to reach six
+        // again -- and that last wait was per GROUP, which R475 measured as
+        // 7.41 cycles a group with a perfect cache. The pipeline now carries
+        // successive groups, so the six cycles are paid once per span while it
+        // fills, and after that a result is standing at the output every cycle
+        // the consumer can take one.
+        T_RUN: begin
+          // R539: issue. The result standing at the pipeline's output goes to
+          // the adapter as a fetch (tx_req = cons_take, payload combinational
+          // from d4_u/d4_v) and its pixel joins the in-flight queue.
+          if (cons_take) begin
+            of_x   [of_wp[OW-2:0]] <= res_x[15:0];
+            of_last[of_wp[OW-2:0]] <= res_last;
+            of_p   [of_wp[OW-2:0]] <= res_p;
+            of_skip[of_wp[OW-2:0]] <= res_skip;   // R607
+            of_reuse[of_wp[OW-2:0]] <= res_reuse; // R633
+            of_wp <= of_wp + 1'd1;
+            // R633: the last real fetch -- a reuse or a skip breaks the chain,
+            // so fetches and reuses alternate
+            lf_v <= !res_skip && !res_reuse;
+            lf_p <= res_p;
+            lf_xn <= res_x[15:0] + 16'(stp(k_p[res_p]));   // R650
+          end
+
+          // R539: retire. The oldest answer joins the oldest pixel. The retire
+          // stage is loaded here and EMPTIED below -- and the two can happen
+          // on the same edge, so the emptying must not undo the loading.
+          if (rt_take) begin
+            rt_valid <= 1'b1;
+            rt_texel <= head_reuse ? lt_texel[8] : tx_texel[8];   // R633, R784
+            rt_lum   <= tlum(head_reuse ? lt_texel[7:0] : tx_texel[7:0],
+                             tex_p[of_p[of_rp[OW-2:0]]][11]);   // R784
+            rt_idx   <= tidx(head_reuse ? lt_texel[7:0] : tx_texel[7:0]);   // R867
+            if (!head_skip && !head_reuse) lt_texel <= tx_texel;
+            rt_x     <= of_x[of_rp[OW-2:0]];
+            rt_last  <= of_last[of_rp[OW-2:0]];
+            rt_p     <= of_p   [of_rp[OW-2:0]];
+            rt_col   <= col_p[of_p[of_rp[OW-2:0]]];   // R731
+            rt_k     <= k_p  [of_p[of_rp[OW-2:0]]];
+            rt_x1    <= x1_p [of_p[of_rp[OW-2:0]]];
+            rt_skip  <= head_skip;                  // R607
+            of_rp    <= of_rp + 1'd1;
+            // R484: WRAPS, DOES NOT SATURATE (see the history in git).
+            if (!head_skip && !head_reuse && tx_texel[7:0] != 8'hff) dbg_texnz <= dbg_texnz + 1'd1;
+          end
+
+          // Colour and emit the retired group.
+          if (rt_valid && (!e_valid || e_rdy)) begin   // R867: e_rdy
+            automatic logic       skip = rt_skip || rt_texel;   // R607, R620
+            if (!rt_take) rt_valid <= 1'b0;       // R539: a take refills it
+            e_valid <= !skip;                     // R326: transparent texel
+            e_last  <= rt_last;                   // R490
+            e_x     <= rt_x;
+            e_x1    <= ((17'(rt_x) + 17'(stp(rt_k)) - 17'sd1) > 17'(rt_x1))
+                         ? rt_x1 : 16'(rt_x + 16'(stp(rt_k)) - 16'sd1);   // R650, R731; R813 16 bits
+            // R784: the product alone here (R741's path); tfin finishes it
+            for (int k = 0; k < 3; k++) begin
+              e_pr[k] <= 14'(rt_col[23 - 8 * k -: 8]) * 14'(rt_lum);
+              e_z[k] <= (rt_col[23 - 8 * k -: 8] == 8'd0) || (rt_lum == 6'd0);
+            end
+            e_p     <= rt_p;                      // R490
+            if (!skip) dbg_texpix <= dbg_texpix + stp(rt_k);   // R484: wraps
+          end
+        end
+
+        default: st <= T_IDLE;
+      endcase
+    end
+  end
+
+  // R867: THE TABLE PATH (TEXLUT). The reference colours a texel as
+  //     L = min(63, lumaram[lumabase + (t >> 1)] * luma / 256)
+  //     colour = gamma(colortable_ch[(c5_ch << 8) | L])
+  // (model2rd.ipp draw_scanline_tex), every table the game's own. R784's
+  // slope model is exact only for a table that is a pedestal plus a straight
+  // line and a luma RAM that is Daytona's (row 0 i/2, row 1 63 - i/2). VF2's
+  // is neither: its row 1 is 49 + i/8 and its colour table has a second ramp
+  // above luma 48, which row 1 selects -- the model inverted those polygons
+  // (the faces' and heads' "checkerboard", the floor white for teal).
+  //   emit (rt -> e): the luma RAM and the palette read, e_pl latched
+  //   e -> lp2:       L = min(63, lr * luma >> 8); the palette entry
+  //   lp2 -> lp3:     the three colour-table reads at {c5, L}
+  //   lp3 -> lp3b:    v - bias, 0 at or below it (m2_geo_engine's gam())
+  //   lp3b -> lp4:    times K; the output takes >> 16, clamped at 255
+  // (R847: the curve's multiply straight off a block RAM's output is the
+  // path that failed in the engine, so the subtract has its own stage.)
+  // All five stages move together whenever the output can (lp_adv).
+  generate if (TEXLUT) begin : g_lut
+    (* ramstyle = "M10K" *) logic [7:0]  lr_mem  [1024];   // eight luma RAM rows (slots)
+    (* ramstyle = "M10K" *) logic [14:0] pal_mem [1024];   // palram 0x1000-0x13ff
+    (* ramstyle = "M10K" *) logic [7:0]  xr_mem  [2048];   // colorxlat, luma 0-63
+    (* ramstyle = "M10K" *) logic [7:0]  xg_mem  [2048];
+    (* ramstyle = "M10K" *) logic [7:0]  xb_mem  [2048];
+    always_ff @(posedge clk) begin
+      if (lut_we && lut_sel == 2'd0) lr_mem [lut_addr[9:0]] <= lut_data[7:0];
+      if (lut_we && lut_sel == 2'd1) pal_mem[lut_addr[9:0]] <= lut_data[14:0];
+      if (lut_we && lut_sel == 2'd2 && lut_addr[12:11] == 2'd0) xr_mem[lut_addr[10:0]] <= lut_data[7:0];
+      if (lut_we && lut_sel == 2'd2 && lut_addr[12:11] == 2'd1) xg_mem[lut_addr[10:0]] <= lut_data[7:0];
+      if (lut_we && lut_sel == 2'd2 && lut_addr[12:11] == 2'd2) xb_mem[lut_addr[10:0]] <= lut_data[7:0];
+    end
+
+    wire emit_go = (st == T_RUN) && rt_valid && (!e_valid || e_rdy);
+    logic [7:0]         e_pl;
+    logic               lp2_v, lp2_last, lp2_moire, lp3_v, lp3_last, lp3_moire;
+    logic signed [15:0] lp2_x, lp2_x1, lp2_y, lp3_x, lp3_x1, lp3_y;
+    logic               lp3b_v, lp3b_last, lp3b_moire;
+    logic signed [15:0] lp3b_x, lp3b_x1, lp3b_y;
+    logic [7:0]         lp3b_d [3];
+    logic [5:0]         lp2_L;
+    logic [14:0]        lp2_c;
+    logic [1:0]         g_sel;
+    logic [7:0]  lr_q;
+    logic [14:0] pal_q;
+    logic [7:0]  xq [3];
+    always_ff @(posedge clk) begin   // registered reads, enabled with their stage
+      if (emit_go) begin
+        lr_q  <= lr_mem [{rt_col[20:18], rt_idx}];
+        pal_q <= pal_mem[rt_col[9:0]];
+      end
+      if (lp_adv) begin
+        xq[0] <= xr_mem[{lp2_c[4:0],   lp2_L}];
+        xq[1] <= xg_mem[{lp2_c[9:5],   lp2_L}];
+        xq[2] <= xb_mem[{lp2_c[14:10], lp2_L}];
+      end
+    end
+
+    /* verilator lint_off UNUSEDSIGNAL */   // lpr[7:0], below the luma
+    wire  [15:0]        lpr  = 16'(lr_q) * 16'(e_pl);
+    /* verilator lint_on UNUSEDSIGNAL */
+    wire  [7:0]         gbias = g_sel[1] ? 8'd0 : g_sel[0] ? 8'd32 : 8'd64;
+    wire  [16:0]        gk    = g_sel[1] ? 17'd65536 : g_sel[0] ? 17'd74941 : 17'd87496;
+    always_ff @(posedge clk or negedge rst_n) begin
+      if (!rst_n) begin
+        e_pl <= 8'd0; g_sel <= 2'd0;
+        lp2_v <= 1'b0; lp2_last <= 1'b0; lp2_moire <= 1'b0; lp2_x <= '0; lp2_x1 <= '0; lp2_y <= '0;
+        lp2_L <= 6'd0; lp2_c <= 15'd0;
+        lp3_v <= 1'b0; lp3_last <= 1'b0; lp3_moire <= 1'b0; lp3_x <= '0; lp3_x1 <= '0; lp3_y <= '0;
+        lp3b_v <= 1'b0; lp3b_last <= 1'b0; lp3b_moire <= 1'b0; lp3b_x <= '0; lp3b_x1 <= '0; lp3b_y <= '0;
+        for (int k = 0; k < 3; k++) lp3b_d[k] <= 8'd0;
+        lp4_v <= 1'b0; lp4_last <= 1'b0; lp4_moire <= 1'b0; lp4_x <= '0; lp4_x1 <= '0; lp4_y <= '0;
+        for (int k = 0; k < 3; k++) lp4_g[k] <= '0;
+      end else begin
+        g_sel <= gamma_sel;
+        if (emit_go) e_pl <= rt_col[17:10];
+        if (lp_adv) begin
+          lp2_v <= e_valid; lp2_last <= e_last; lp2_x <= e_x; lp2_x1 <= e_x1;
+          lp2_y <= y_p[e_p]; lp2_moire <= moire_p[e_p];
+          lp2_L <= (lpr[15:8] > 8'd63) ? 6'd63 : lpr[13:8];
+          lp2_c <= pal_q;
+          lp3_v <= lp2_v; lp3_last <= lp2_last; lp3_x <= lp2_x; lp3_x1 <= lp2_x1;
+          lp3_y <= lp2_y; lp3_moire <= lp2_moire;
+          lp3b_v <= lp3_v; lp3b_last <= lp3_last; lp3b_x <= lp3_x; lp3b_x1 <= lp3_x1;
+          lp3b_y <= lp3_y; lp3b_moire <= lp3_moire;
+          for (int k = 0; k < 3; k++) lp3b_d[k] <= (xq[k] > gbias) ? xq[k] - gbias : 8'd0;
+          lp4_v <= lp3b_v; lp4_last <= lp3b_last; lp4_x <= lp3b_x; lp4_x1 <= lp3b_x1;
+          lp4_y <= lp3b_y; lp4_moire <= lp3b_moire;
+          for (int k = 0; k < 3; k++) lp4_g[k] <= 25'(lp3b_d[k]) * 25'(gk);
+        end
+      end
+    end
+    assign lp_busy = lp2_v || lp3_v || lp3b_v || lp4_v;
+  end else begin : g_nolut
+    assign lp_busy = 1'b0;
+    assign lp4_v = 1'b0; assign lp4_last = 1'b0; assign lp4_moire = 1'b0;
+    assign lp4_x = '0; assign lp4_x1 = '0; assign lp4_y = '0;
+    assign lp4_g[0] = '0; assign lp4_g[1] = '0; assign lp4_g[2] = '0;
+  end endgenerate
+
+endmodule
