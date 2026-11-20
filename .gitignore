@@ -1,0 +1,31 @@
+# Upstream MiSTer repos (cloned locally for reference / Phase 0)
+upstream/
+
+# Quartus build products & Phase 0 synthesis runs
+phase0_bench/runs/
+build/
+db/
+incremental_db/
+output_files/
+*.rpt
+*.summary
+*.smsg
+*.pin
+*.qws
+*.sof
+*.rbf
+*.rbf_r
+*.jdi
+*.done
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# ROMs & MAME assets (never commit ROM data)
+roms/*
+!roms/README.md
+*.rom
+*.zip
+*.7z

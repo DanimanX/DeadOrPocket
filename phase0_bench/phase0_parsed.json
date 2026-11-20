@@ -1,0 +1,178 @@
+[
+  {
+    "name": "i960_2a_full",
+    "alm_est": 8387,
+    "aluts": 12471,
+    "mem_aluts": 898,
+    "regs": 4519,
+    "mem_bits": 98304,
+    "m10k_est": 13,
+    "mlab_bits": 18896,
+    "dsp": 7
+  },
+  {
+    "name": "i960_2a_trim",
+    "alm_est": 7357,
+    "aluts": 11044,
+    "mem_aluts": 706,
+    "regs": 4315,
+    "mem_bits": 57344,
+    "m10k_est": 8,
+    "mlab_bits": 10600,
+    "dsp": 7
+  },
+  {
+    "name": "copro_m2",
+    "alm_est": 2644,
+    "aluts": 3790,
+    "mem_aluts": 0,
+    "regs": 3157,
+    "mem_bits": 98562,
+    "m10k_est": 12,
+    "mlab_bits": 0,
+    "dsp": 1
+  },
+  {
+    "name": "copro_2a",
+    "alm_est": 2945,
+    "aluts": 4307,
+    "mem_aluts": 79,
+    "regs": 2863,
+    "mem_bits": 164098,
+    "m10k_est": 19,
+    "mlab_bits": 2016,
+    "dsp": 1
+  },
+  {
+    "name": "geometry_2a",
+    "alm_est": 6200,
+    "aluts": 6907,
+    "mem_aluts": 301,
+    "regs": 8815,
+    "mem_bits": 10532,
+    "m10k_est": 2,
+    "mlab_bits": 6652,
+    "dsp": 3
+  },
+  {
+    "name": "raster3d_2a",
+    "alm_est": 8228,
+    "aluts": 12185,
+    "mem_aluts": 505,
+    "regs": 9724,
+    "mem_bits": 1944156,
+    "m10k_est": 208,
+    "mlab_bits": 13984,
+    "dsp": 52
+  },
+  {
+    "name": "quad_store_2a",
+    "alm_est": 728,
+    "aluts": 1204,
+    "mem_aluts": 22,
+    "regs": 465,
+    "mem_bits": 1484800,
+    "m10k_est": 151,
+    "mlab_bits": 352,
+    "dsp": 0
+  },
+  {
+    "name": "video_2d",
+    "alm_est": 1598,
+    "aluts": 1743,
+    "mem_aluts": 72,
+    "regs": 2296,
+    "mem_bits": 122880,
+    "m10k_est": 16,
+    "mlab_bits": 2304,
+    "dsp": 2
+  },
+  {
+    "name": "char_cache_8k",
+    "alm_est": 205,
+    "aluts": 307,
+    "mem_aluts": 0,
+    "regs": 290,
+    "mem_bits": 557056,
+    "m10k_est": 56,
+    "mlab_bits": 0,
+    "dsp": 0
+  },
+  {
+    "name": "char_cache_2k",
+    "alm_est": 202,
+    "aluts": 303,
+    "mem_aluts": 0,
+    "regs": 288,
+    "mem_bits": 143360,
+    "m10k_est": 15,
+    "mlab_bits": 0,
+    "dsp": 0
+  },
+  {
+    "name": "sound_m2",
+    "alm_est": 4307,
+    "aluts": 6210,
+    "mem_aluts": 420,
+    "regs": 4130,
+    "mem_bits": 179571,
+    "m10k_est": 24,
+    "mlab_bits": 13440,
+    "dsp": 6
+  },
+  {
+    "name": "sound_2a",
+    "alm_est": 4449,
+    "aluts": 6385,
+    "mem_aluts": 212,
+    "regs": 3838,
+    "mem_bits": 228128,
+    "m10k_est": 40,
+    "mlab_bits": 5440,
+    "dsp": 6
+  },
+  {
+    "name": "ioz80_m2",
+    "alm_est": 1177,
+    "aluts": 1820,
+    "mem_aluts": 32,
+    "regs": 783,
+    "mem_bits": 196608,
+    "m10k_est": 24,
+    "mlab_bits": 1024,
+    "dsp": 0
+  },
+  {
+    "name": "sdram_13p",
+    "alm_est": 1219,
+    "aluts": 782,
+    "mem_aluts": 0,
+    "regs": 2087,
+    "mem_bits": 0,
+    "m10k_est": 0,
+    "mlab_bits": 0,
+    "dsp": 0
+  },
+  {
+    "name": "sdram_8p",
+    "alm_est": 862,
+    "aluts": 697,
+    "mem_aluts": 0,
+    "regs": 1485,
+    "mem_bits": 0,
+    "m10k_est": 0,
+    "mlab_bits": 0,
+    "dsp": 0
+  },
+  {
+    "name": "cpu_bridge_2a",
+    "alm_est": 893,
+    "aluts": 1382,
+    "mem_aluts": 0,
+    "regs": 911,
+    "mem_bits": 169984,
+    "m10k_est": 17,
+    "mlab_bits": 0,
+    "dsp": 0
+  }
+]

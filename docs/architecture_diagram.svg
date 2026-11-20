@@ -1,0 +1,233 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 860" width="1440" height="860" font-family="'Segoe UI', 'Inter', system-ui, -apple-system, sans-serif">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1020"/>
+      <stop offset="100%" stop-color="#111a30"/>
+    </linearGradient>
+    <linearGradient id="cartGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1c2541"/>
+      <stop offset="100%" stop-color="#12182d"/>
+    </linearGradient>
+    <linearGradient id="pocketGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#142d38"/>
+      <stop offset="100%" stop-color="#0e1e28"/>
+    </linearGradient>
+    <linearGradient id="busGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3b2608"/>
+      <stop offset="100%" stop-color="#241705"/>
+    </linearGradient>
+    <marker id="arrAmber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,1 L9,5 L0,9 z" fill="#f59e0b"/>
+    </marker>
+    <marker id="arrCyan" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,1 L9,5 L0,9 z" fill="#38bdf8"/>
+    </marker>
+    <marker id="arrGreen" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,1 L9,5 L0,9 z" fill="#34d399"/>
+    </marker>
+    <marker id="arrPurple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,1 L9,5 L0,9 z" fill="#a78bfa"/>
+    </marker>
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1440" height="860" fill="url(#bgGrad)"/>
+
+  <!-- Title Banner -->
+  <rect x="24" y="18" width="1392" height="72" rx="12" fill="#131c36" stroke="#2a3b68" stroke-width="1.5"/>
+  <text x="48" y="50" fill="#f8fafc" font-size="26" font-weight="800" letter-spacing="0.5">DeadOrPocket — Sega Model 2 &amp; Model 2A-CRX Hybrid Architecture @ 57.52 Hz (60 fps)</text>
+  <text x="48" y="74" fill="#94a3b8" font-size="13.5">Phase 0 verified in Quartus Prime 25.1 Lite (5CEBA4F23C8) · SpaceFish openFPGA methodology · 16-bit Sync Cartridge Bus (50–66 MB/s)</text>
+  <rect x="1208" y="34" width="188" height="38" rx="8" fill="#064e3b" stroke="#10b981" stroke-width="1.5"/>
+  <text x="1302" y="58" fill="#6ee7b7" font-size="14" font-weight="700" text-anchor="middle">PHASE 0: VERIFIED</text>
+
+  <!-- ==================== LEFT PANEL: COMPUTE CARTRIDGE ==================== -->
+  <rect x="24" y="108" width="520" height="656" rx="14" fill="url(#cartGrad)" stroke="#6366f1" stroke-width="2" filter="url(#shadow)"/>
+  <rect x="24" y="108" width="520" height="54" rx="14" fill="#312e81"/>
+  <rect x="24" y="148" width="520" height="14" fill="#312e81"/>
+  <text x="44" y="135" fill="#ffffff" font-size="18" font-weight="800">1. COMPUTE CARTRIDGE ("Model 2/2A Compute Cart")</text>
+  <text x="44" y="154" fill="#c7d2fe" font-size="12">FPGA (Cyclone V 5CEBA5/7 · Gowin GW5AST-60 · ECP5-85F) + 64–128 MB SDRAM</text>
+
+  <!-- i960KB -->
+  <rect x="44" y="180" width="232" height="114" rx="10" fill="#1e293b" stroke="#818cf8" stroke-width="1.5"/>
+  <text x="58" y="204" fill="#e0e7ff" font-size="15" font-weight="700">Intel i960KB + FPU</text>
+  <text x="58" y="222" fill="#94a3b8" font-size="12">i960_top (40 MHz · MAME Lockstep)</text>
+  <text x="58" y="242" fill="#a5b4fc" font-size="12" font-weight="600">• 8,387 ALMs | 7 DSP | 13 M10K</text>
+  <text x="58" y="260" fill="#cbd5e1" font-size="11.5">• 8 KB I-Cache, D-Cache, RC Ring 8</text>
+  <text x="58" y="278" fill="#cbd5e1" font-size="11.5">• Full FP_SUBN=2 (Model 2 &amp; 2A)</text>
+
+  <!-- TGP -->
+  <rect x="292" y="180" width="232" height="114" rx="10" fill="#1e293b" stroke="#818cf8" stroke-width="1.5"/>
+  <text x="306" y="204" fill="#e0e7ff" font-size="15" font-weight="700">Fujitsu MB86233 TGP</text>
+  <text x="306" y="222" fill="#94a3b8" font-size="12">m2_copro (80 MHz · Real Microcode)</text>
+  <text x="306" y="242" fill="#a5b4fc" font-size="12" font-weight="600">• 2,945 ALMs (2A) / 2,644 (M2)</text>
+  <text x="306" y="260" fill="#cbd5e1" font-size="11.5">• 1 DSP | 19 M10K (2A) / 12 (M2)</text>
+  <text x="306" y="278" fill="#cbd5e1" font-size="11.5">• Physics, collisions &amp; matrix math</text>
+
+  <!-- Geometry -->
+  <rect x="44" y="310" width="480" height="104" rx="10" fill="#1e293b" stroke="#c084fc" stroke-width="1.5"/>
+  <text x="58" y="334" fill="#f3e8ff" font-size="15" font-weight="700">Full 3D Geometry Engine (m2_geometry + m2_geo)</text>
+  <text x="58" y="354" fill="#d8b4fe" font-size="12" font-weight="600">• 6,200 ALMs | 3 DSP | 2 M10K | 8,815 Regs (measured Q25.1)</text>
+  <text x="58" y="374" fill="#cbd5e1" font-size="12">Display-list walker → Transform → Lighting → 3D Clipping → Projection</text>
+  <text x="58" y="394" fill="#fde68a" font-size="12" font-weight="600">Clean seam: up to 2,560 projected quads/frame (~64 B/quad) → TX FIFO</text>
+
+  <!-- Sound Board -->
+  <rect x="44" y="430" width="276" height="114" rx="10" fill="#1e293b" stroke="#34d399" stroke-width="1.5"/>
+  <text x="58" y="454" fill="#d1fae5" font-size="14.5" font-weight="700">Sound Board (M2 &amp; M2A)</text>
+  <text x="58" y="473" fill="#6ee7b7" font-size="11.5" font-weight="600">• 2A: fx68k + SCSP + DSP (4,449 ALM, 40 M10K)</text>
+  <text x="58" y="491" fill="#6ee7b7" font-size="11.5" font-weight="600">• M2: fx68k + YM3438 + 2×MPCM (4,307 ALM)</text>
+  <text x="58" y="510" fill="#cbd5e1" font-size="11.5">• 6 DSP | Full reverb (DOA bass drone fixed)</text>
+  <text x="58" y="528" fill="#fde68a" font-size="11.5" font-weight="600">Output: 48 kHz Stereo PCM (192 KB/s)</text>
+
+  <!-- I/O Board -->
+  <rect x="334" y="430" width="190" height="114" rx="10" fill="#1e293b" stroke="#38bdf8" stroke-width="1.5"/>
+  <text x="348" y="454" fill="#e0f2fe" font-size="14.5" font-weight="700">I/O + CPU Bridge</text>
+  <text x="348" y="473" fill="#7dd3fc" font-size="11.5" font-weight="600">• m2_cpu_bridge (893 ALM)</text>
+  <text x="348" y="491" fill="#7dd3fc" font-size="11.5" font-weight="600">• m2_ioz80 (M2: 1,177 ALM)</text>
+  <text x="348" y="510" fill="#cbd5e1" font-size="11.5">• 2A: 315-5649 + 93C46</text>
+  <text x="348" y="528" fill="#cbd5e1" font-size="11.5">• Captures 2D write deltas</text>
+
+  <!-- Cart SDRAM & Power -->
+  <rect x="44" y="560" width="480" height="94" rx="10" fill="#0f172a" stroke="#475569" stroke-width="1.5"/>
+  <text x="58" y="582" fill="#f1f5f9" font-size="14" font-weight="700">Local Cartridge SDRAM (64–128 MB) &amp; Power</text>
+  <text x="58" y="602" fill="#cbd5e1" font-size="12">• Stores: i960 Prog/Data (1–32 MB) + Polygons (13–24 MB) + Copro (4 MB) + Audio (8.5 MB)</text>
+  <text x="58" y="620" fill="#94a3b8" font-size="12">• Dead or Alive (57.75 MB cart + 8 MB Pocket textures) fits even a 64 MB Cart SDRAM!</text>
+  <text x="58" y="638" fill="#fbbf24" font-size="11.5">• Power: Slot 5V/200 mA (1.0 W) &gt;92% buck + optional aux USB-C · Strict 3.3V bus I/O</text>
+
+  <!-- Cart Totals Footer -->
+  <rect x="44" y="670" width="480" height="76" rx="8" fill="#1e1b4b" stroke="#818cf8" stroke-width="1"/>
+  <text x="58" y="694" fill="#c7d2fe" font-size="13" font-weight="700">MEASURED CARTRIDGE TOTAL (Quartus 25.1 Lite):</text>
+  <text x="58" y="715" fill="#ffffff" font-size="13">Model 2A: <tspan fill="#a5b4fc" font-weight="700">~24,180 ALMs</tspan> (~57K LUT4) · <tspan fill="#34d399" font-weight="700">~91 M10K</tspan> · <tspan fill="#fbbf24" font-weight="700">17 DSP</tspan></text>
+  <text x="58" y="734" fill="#ffffff" font-size="13">Model 2:  <tspan fill="#a5b4fc" font-weight="700">~24,915 ALMs</tspan> (~59K LUT4) · <tspan fill="#34d399" font-weight="700">~93 M10K</tspan> · <tspan fill="#fbbf24" font-weight="700">17 DSP</tspan></text>
+
+  <!-- ==================== CENTER: CARTRIDGE SLOT BUS ==================== -->
+  <rect x="568" y="156" width="232" height="560" rx="14" fill="url(#busGrad)" stroke="#f59e0b" stroke-width="2" filter="url(#shadow)"/>
+  <text x="684" y="186" fill="#fef3c7" font-size="16" font-weight="800" text-anchor="middle">CARTRIDGE SLOT</text>
+  <text x="684" y="206" fill="#fcd34d" font-size="12" font-weight="600" text-anchor="middle">30 I/O Pins (apf_top.v)</text>
+  <text x="684" y="224" fill="#fbbf24" font-size="11.5" text-anchor="middle">16-bit Sync @ 25–33 MHz</text>
+
+  <rect x="584" y="240" width="200" height="54" rx="8" fill="#451a03" stroke="#f59e0b" stroke-width="1"/>
+  <text x="684" y="262" fill="#fde68a" font-size="13" font-weight="700" text-anchor="middle">Capacity: 50–66 MB/s</text>
+  <text x="684" y="281" fill="#6ee7b7" font-size="12.5" font-weight="700" text-anchor="middle">Peak traffic: 14.2 MB/s</text>
+
+  <!-- Streams -->
+  <rect x="584" y="312" width="200" height="72" rx="8" fill="#1c1917" stroke="#c084fc" stroke-width="1.2"/>
+  <text x="596" y="333" fill="#e9d5ff" font-size="12.5" font-weight="700">CH0 · 3D Quads →</text>
+  <text x="596" y="352" fill="#cbd5e1" font-size="11.5">≤ 2,560 quads × 64 B/frame</text>
+  <text x="596" y="370" fill="#fde68a" font-size="12" font-weight="700">9.42 MB/s @ 57.52 Hz</text>
+
+  <rect x="584" y="396" width="200" height="68" rx="8" fill="#1c1917" stroke="#38bdf8" stroke-width="1.2"/>
+  <text x="596" y="417" fill="#bae6fd" font-size="12.5" font-weight="700">CH1 · 2D Tile/Char/Pal →</text>
+  <text x="596" y="435" fill="#cbd5e1" font-size="11.5">i960 2D write deltas</text>
+  <text x="596" y="452" fill="#fde68a" font-size="12" font-weight="700">0.2 – 4.60 MB/s</text>
+
+  <rect x="584" y="476" width="200" height="62" rx="8" fill="#1c1917" stroke="#34d399" stroke-width="1.2"/>
+  <text x="596" y="497" fill="#a7f3d0" font-size="12.5" font-weight="700">CH2 · Stereo PCM →</text>
+  <text x="596" y="515" fill="#cbd5e1" font-size="11.5">48 kHz 16-bit Stereo</text>
+  <text x="596" y="531" fill="#fde68a" font-size="12" font-weight="700">0.19 MB/s</text>
+
+  <rect x="584" y="550" width="200" height="62" rx="8" fill="#1c1917" stroke="#fb7185" stroke-width="1.2"/>
+  <text x="596" y="571" fill="#fecdd3" font-size="12.5" font-weight="700">← CH3 · Inputs / VSync</text>
+  <text x="596" y="589" fill="#cbd5e1" font-size="11.5">Pad/Dock + VBlank + Boot</text>
+  <text x="596" y="605" fill="#fde68a" font-size="12" font-weight="700">&lt; 0.01 MB/s</text>
+
+  <!-- Pinout box -->
+  <rect x="584" y="626" width="200" height="76" rx="8" fill="#291a04" stroke="#d97706" stroke-width="1"/>
+  <text x="594" y="644" fill="#fcd34d" font-size="11" font-weight="700">Bank Mapping (3.3V):</text>
+  <text x="594" y="660" fill="#e5e7eb" font-size="10.5">• Bank2+3 [15:0]: DATA[15:0]</text>
+  <text x="594" y="675" fill="#e5e7eb" font-size="10.5">• Bank1 [7:0]: CMD/CHAN/HDR</text>
+  <text x="594" y="690" fill="#e5e7eb" font-size="10.5">• Bank0+P30/31: CLK/CTL/RDY/IRQ</text>
+
+  <!-- Bus Arrows -->
+  <line x1="544" y1="348" x2="580" y2="348" stroke="#a78bfa" stroke-width="3" marker-end="url(#arrPurple)"/>
+  <line x1="786" y1="348" x2="822" y2="348" stroke="#a78bfa" stroke-width="3" marker-end="url(#arrPurple)"/>
+
+  <line x1="544" y1="430" x2="580" y2="430" stroke="#38bdf8" stroke-width="3" marker-end="url(#arrCyan)"/>
+  <line x1="786" y1="430" x2="822" y2="430" stroke="#38bdf8" stroke-width="3" marker-end="url(#arrCyan)"/>
+
+  <line x1="544" y1="507" x2="580" y2="507" stroke="#34d399" stroke-width="3" marker-end="url(#arrGreen)"/>
+  <line x1="786" y1="507" x2="822" y2="507" stroke="#34d399" stroke-width="3" marker-end="url(#arrGreen)"/>
+
+  <line x1="822" y1="581" x2="786" y2="581" stroke="#f59e0b" stroke-width="3" marker-end="url(#arrAmber)"/>
+  <line x1="580" y1="581" x2="544" y2="581" stroke="#f59e0b" stroke-width="3" marker-end="url(#arrAmber)"/>
+
+  <!-- ==================== RIGHT PANEL: ANALOGUE POCKET ==================== -->
+  <rect x="824" y="108" width="592" height="656" rx="14" fill="url(#pocketGrad)" stroke="#0ea5e9" stroke-width="2" filter="url(#shadow)"/>
+  <rect x="824" y="108" width="592" height="54" rx="14" fill="#0c4a6e"/>
+  <rect x="824" y="148" width="592" height="14" fill="#0c4a6e"/>
+  <text x="844" y="135" fill="#ffffff" font-size="18" font-weight="800">2. ANALOGUE POCKET — Cyclone V 5CEBA4F23C8 ("Render &amp; I/O")</text>
+  <text x="844" y="154" fill="#bae6fd" font-size="12">18,480 ALMs · 308 M10K · 66 DSP · 4 External Memories (96.25 MB) · SpaceFish Scaffolding</text>
+
+  <!-- Raster3D -->
+  <rect x="844" y="180" width="330" height="142" rx="10" fill="#132230" stroke="#38bdf8" stroke-width="1.8"/>
+  <text x="858" y="204" fill="#e0f2fe" font-size="15.5" font-weight="700">Full 3D Rasterizer (m2_raster3d)</text>
+  <text x="858" y="224" fill="#7dd3fc" font-size="12" font-weight="600">• 8,228 ALMs | 52 DSP | 57–208 M10K (Q25.1)</text>
+  <text x="858" y="244" fill="#cbd5e1" font-size="12">• 100% Full Fidelity: Bilinear + Mip-mapping + FTB</text>
+  <text x="858" y="262" fill="#cbd5e1" font-size="12">• 2,560 quads/frame · Span culling · 4 texel ports</text>
+  <text x="858" y="280" fill="#6ee7b7" font-size="12" font-weight="600">• Offload quad_store (160 KB) → Async SRAM (-151 M10K)</text>
+  <text x="858" y="298" fill="#fde68a" font-size="12">• 16-bit RGB565 Framebuffer → CRAM0/CRAM1</text>
+
+  <!-- 2D Video + Compositor -->
+  <rect x="844" y="338" width="330" height="114" rx="10" fill="#132230" stroke="#38bdf8" stroke-width="1.5"/>
+  <text x="858" y="362" fill="#e0f2fe" font-size="15" font-weight="700">Pixel-Exact 2D Video (m2_video + char_cache)</text>
+  <text x="858" y="382" fill="#7dd3fc" font-size="12" font-weight="600">• 1,900 ALMs | 2 DSP | 31–95 M10K (Q25.1)</text>
+  <text x="858" y="402" fill="#cbd5e1" font-size="12">• 4-line ring buffer + 2K/4K Char Cache + Palette</text>
+  <text x="858" y="420" fill="#cbd5e1" font-size="12">• 2D + 3D Scanout Compositor → RGB24 @ 15.98 MHz</text>
+  <text x="858" y="438" fill="#6ee7b7" font-size="11.5">• Tile/Pal RAM (80 KB) eligible for Async SRAM</text>
+
+  <!-- APF + SpaceFish Glue -->
+  <rect x="844" y="468" width="330" height="108" rx="10" fill="#132230" stroke="#34d399" stroke-width="1.5"/>
+  <text x="858" y="492" fill="#d1fae5" font-size="14.5" font-weight="700">APF + SpaceFish Infrastructure</text>
+  <text x="858" y="511" fill="#6ee7b7" font-size="12" font-weight="600">• ~1,930 ALMs | 0 DSP | 8 M10K (measured)</text>
+  <text x="858" y="530" fill="#cbd5e1" font-size="11.5">• m2_sdram (8p: 862 ALM) + 2× psram_phy (222 ALM)</text>
+  <text x="858" y="548" fill="#cbd5e1" font-size="11.5">• apf_top + pk_io + Cart PHY + sound_i2s (38 ALM)</text>
+  <text x="858" y="566" fill="#fde68a" font-size="11.5">• 2 PLLs: VCO 959.06 MHz (95.9 / 79.9 / 15.98 MHz)</text>
+
+  <!-- External 4 Memories Column -->
+  <rect x="1192" y="180" width="206" height="86" rx="10" fill="#0f172a" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="1204" y="202" fill="#67e8f9" font-size="13.5" font-weight="700">64 MB SDR SDRAM</text>
+  <text x="1204" y="220" fill="#cbd5e1" font-size="11.5">dram_* @ 95.9 MHz</text>
+  <text x="1204" y="237" fill="#94a3b8" font-size="11">Textures (8–16 MB) +</text>
+  <text x="1204" y="252" fill="#94a3b8" font-size="11">2D Chars + Boot Staging</text>
+
+  <rect x="1192" y="278" width="206" height="86" rx="10" fill="#0f172a" stroke="#10b981" stroke-width="1.5"/>
+  <text x="1204" y="300" fill="#6ee7b7" font-size="13.5" font-weight="700">16 MB PSRAM 0 (CRAM0)</text>
+  <text x="1204" y="318" fill="#cbd5e1" font-size="11.5">psram_phy #1 @ 48 MHz</text>
+  <text x="1204" y="335" fill="#94a3b8" font-size="11">3D FB Bank A (381 KB)</text>
+  <text x="1204" y="350" fill="#94a3b8" font-size="11">RGB565 · Zero DDR3</text>
+
+  <rect x="1192" y="376" width="206" height="86" rx="10" fill="#0f172a" stroke="#10b981" stroke-width="1.5"/>
+  <text x="1204" y="398" fill="#6ee7b7" font-size="13.5" font-weight="700">16 MB PSRAM 1 (CRAM1)</text>
+  <text x="1204" y="416" fill="#cbd5e1" font-size="11.5">psram_phy #2 @ 48 MHz</text>
+  <text x="1204" y="433" fill="#94a3b8" font-size="11">3D FB Bank B (Ping-Pong)</text>
+  <text x="1204" y="448" fill="#94a3b8" font-size="11">Zero R/W contention!</text>
+
+  <rect x="1192" y="474" width="206" height="102" rx="10" fill="#0f172a" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="1204" y="496" fill="#fde68a" font-size="13.5" font-weight="700">256 KB Async SRAM</text>
+  <text x="1204" y="514" fill="#cbd5e1" font-size="11.5">sram_* (128K×16 · 10 ns)</text>
+  <text x="1204" y="532" fill="#94a3b8" font-size="11">Option A: Quad Store 160 KB</text>
+  <text x="1204" y="548" fill="#94a3b8" font-size="11">Option B: Tile+Pal 80 KB</text>
+  <text x="1204" y="564" fill="#6ee7b7" font-size="11" font-weight="700">Frees 64–151 M10K!</text>
+
+  <!-- Outputs -->
+  <rect x="844" y="592" width="268" height="62" rx="10" fill="#082f49" stroke="#38bdf8" stroke-width="1.5"/>
+  <text x="858" y="616" fill="#e0f2fe" font-size="13.5" font-weight="700">APF Video Scaler (LCD / Dock)</text>
+  <text x="858" y="638" fill="#7dd3fc" font-size="12">496×384 Progressive · 57.52 Hz · 4:3</text>
+
+  <rect x="1126" y="592" width="272" height="62" rx="10" fill="#064e3b" stroke="#34d399" stroke-width="1.5"/>
+  <text x="1140" y="616" fill="#d1fae5" font-size="13.5" font-weight="700">APF Audio DAC (sound_i2s)</text>
+  <text x="1140" y="638" fill="#6ee7b7" font-size="12">48 kHz Stereo · MCLK 12.288 MHz</text>
+
+  <!-- Pocket Totals Footer -->
+  <rect x="844" y="670" width="554" height="76" rx="8" fill="#082f49" stroke="#38bdf8" stroke-width="1"/>
+  <text x="858" y="694" fill="#bae6fd" font-size="13" font-weight="700">MEASURED ANALOGUE POCKET TOTAL (5CEBA4F23C8 · Quartus 25.1):</text>
+  <text x="858" y="715" fill="#ffffff" font-size="13">ALMs: <tspan fill="#6ee7b7" font-weight="700">~12,060 / 18,480 (65.3%)</tspan> · DSP: <tspan fill="#6ee7b7" font-weight="700">54 / 66 (81.8%)</tspan></text>
+  <text x="858" y="734" fill="#ffffff" font-size="13">M10K: <tspan fill="#6ee7b7" font-weight="700">160–247 / 308 (52%–80% with SRAM offload)</tspan> · Headroom: <tspan fill="#fde68a" font-weight="700">+35% ALMs</tspan></text>
+
+  <!-- Bottom Legend / Validation Footer -->
+  <rect x="24" y="782" width="1392" height="58" rx="10" fill="#131c36" stroke="#2a3b68" stroke-width="1"/>
+  <text x="44" y="806" fill="#e2e8f0" font-size="13" font-weight="700">Phase 0 Verification (Quartus Prime 25.1 Lite · 16/16 modules synthesized cleanly with zero RAM-to-FF inference warnings):</text>
+  <text x="44" y="827" fill="#94a3b8" font-size="12.5">• Targets both boards: Sega Model 2 (Daytona USA, Desert Tank, Virtua Cop) and Model 2A-CRX (Dead or Alive, Virtua Fighter 2, Sega Rally, Manx TT, Virtua Cop 2, Zero Gunner) at full 60 fps.</text>
+</svg>
