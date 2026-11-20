@@ -31,7 +31,9 @@ roms/*
 !Release/DeadOrPocket_Pocket_*.zip
 *.7z
 
-# Unpacked SD release staging & temporary asset previews
+# Unpacked SD release staging, Verilator sim build dirs & temporary asset previews
 Release/sd_card/
+sim/obj_*/
+sim/out/
 docs/kasumi_raw.jpg
 docs/*_preview.png

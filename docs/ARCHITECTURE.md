@@ -132,17 +132,22 @@ Using the integer-counter Cyclone V PLL pattern proven in [SpaceFish `f3_pll.sv`
 
 ---
 
-## 4.1 Phase 1 Verified Silicon Fit (`5CEBA4F23C8` · Quartus Prime 25.1 Lite)
+## 4.1 Phase 1 & Phase 2 Verified Silicon Fit (`5CEBA4F23C8` · Quartus Prime 25.1 Lite)
 
-Full place-and-route and 4-corner Static Timing Analysis of [`src/fpga/pocket_deadorpocket.qpf`](../src/fpga/pocket_deadorpocket.qpf) (`HIGH PERFORMANCE EFFORT`, `SYNTH_TIMING_DRIVEN_SYNTHESIS ON`):
+Full place-and-route and 4-corner Static Timing Analysis of [`src/fpga/pocket_deadorpocket.qpf`](../src/fpga/pocket_deadorpocket.qpf) (`HIGH PERFORMANCE EFFORT`, `SYNTH_TIMING_DRIVEN_SYNTHESIS ON`), including Phase 2 Cart Bus v2 live SDRAM Texture/Char streaming (Port 5) and 27-bit `q_tex`:
 
-- **Logic utilization (ALMs):** `10,373 / 18,480` (**56%**)
-- **Total registers:** `14,149`
-- **Total block memory bits:** `2,735,996 / 3,153,920` (**87%**)
-- **Total M10K RAM blocks:** `303 / 308` (**98%**) — achieved by moving small span/CDC queues (`u_span_q` in `m2_raster3d.sv` and `q_tex`/`q_u`/`q_v` in `m2_texel_cdc.sv`) to MLABs, keeping **all 256 KB of Async SRAM (`sram_*`) free** for Phase 2!
+- **Logic utilization (ALMs):** `10,563 / 18,480` (**57%**)
+- **Total registers:** `14,495`
+- **Total block memory bits:** `2,740,092 / 3,153,920` (**87%**)
+- **Total M10K RAM blocks:** `303 / 308` (**98%**) — achieved by moving small span/CDC queues (`u_span_q` in `m2_raster3d.sv` and `q_tex`/`q_u`/`q_v` in `m2_texel_cdc.sv`) to MLABs and using a zero-M10K 2-FF toggle CDC for Port 5 SDRAM writes, keeping **all 256 KB of Async SRAM (`sram_*`) free**!
 - **Total DSP blocks:** `55 / 66` (**83%**)
 - **Total PLLs:** `2 / 4` (**50%**)
-- **4-Corner STA (`Slow 85C`, `Slow 0C`, `Fast 85C`, `Fast 0C`):** **0.000 ns TNS** across all 7 clock domains (`clk_sys` `+0.296 ns` min setup, `clk_mem` `+1.176 ns` min setup, all hold/recovery/removal/MPW positive).
+- **4-Corner STA (`Slow 85C`, `Slow 0C`, `Fast 85C`, `Fast 0C`):** **0.000 ns TNS** across all 7 clock domains (`clk_sys` `+0.587 ns` / `+0.149 ns` setup, `clk_mem` `+1.607 ns` / `+1.121 ns` setup, all hold/recovery/removal/MPW positive).
+
+### Phase 2 Verilator Co-Simulation Findings
+- **Full 4-channel bus & render co-sim (`sim/tb_hybrid_bus_top.sv`):** Verified `7,445 TX / 7,445 RX` bus words with **0 bus contention cycles**, **0 JEDEC SDRAM violations** (`1,040 reads`, `1,024 writes`), **2,441/2,441 bit-exact CH2 PCM audio samples**, **3/3 CH3 VBlank input roundtrips**, and **189,115 / 190,080 3D pixels rendered** (including live bilinear-filtered `TEXS0` texture fetches uploaded over CH1).
+- **Real Model 2A-CRX i960 ROM boot (`sim/tb_m2a_cart_top.sv`):** Verified real *Virtua Fighter 2* (`vf2.rom`) executing **1,698,138 i960 accesses** (`0 traps`, `0 halts`) and streaming **80,121 live CH1 video writes** (`145,547` bus words, **0 contention**) into Pocket `m2_video`, plus *Dead or Alive* (`doaab.rom`) executing **3,185,370 i960 accesses** (`0 traps`, `0 halts`, `FR=1, F2A=1`).
+- **Phase 3 Protocol Enhancement Note:** Under synthetic 2,048-quad continuous back-to-back stress (`--stress`), sharing a single Pocket RX FIFO between CH0 quads and CH2 audio means CH0 backpressure when `m2_raster3d` drops `q_ready` can delay CH2 audio if the cartridge emits quads before VBlank. In Phase 3, exposing a 1-bit `R3D_Q_READY` status flag in `CH3` (so `m2_cart_host` gates CH0 quad bursts while keeping CH2 audio flowing) guarantees 100% non-blocking audio even under pathological mid-frame double-flips.
 
 ---
 

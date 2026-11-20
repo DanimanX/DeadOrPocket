@@ -1,4 +1,4 @@
-// m2_cart_bus: 30-pin Analogue Pocket Cartridge Slot Synchronous 16-bit Bus PHY
+// m2_cart_bus: 30-pin Analogue Pocket Cartridge Slot Synchronous 16-bit Bus PHY (v2)
 //
 // Physical mapping on Analogue Pocket (3.3V translated banks in apf_top.v):
 //   cart_tran_bank0[7:4] (dir=1, Pocket->Cart):
@@ -6,13 +6,13 @@
 //     [6] BUS_DIR (0 = Cart->Pocket RX, 1 = Pocket->Cart TX during VBlank)
 //     [5] VSYNC_PULSE
 //     [4] SOFT_RST_N
-//   cart_tran_pin30 (dir=1, Pocket->Cart): POCKET_READY (RX FIFO not almost-full)
+//   cart_tran_pin30 (dir=1, Pocket->Cart): POCKET_READY (RX FIFO not almost-full & bus in RX)
 //   cart_tran_pin31 (dir=0, Cart->Pocket): CART_VALID (packet beat valid)
 //   cart_tran_bank1[7:0] (dir=0 during RX, dir=1 during TX):
-//     PKT_HDR[7:0]: [1:0] channel (0=3D Quad, 1=2D Write, 2=Audio PCM, 3=Inputs/Status)
+//     PKT_HDR[7:0]: [1:0] channel (0=3D Quad, 1=2D/LUT/SDRAM Write, 2=Audio PCM, 3=Inputs/Status)
 //                   [2]   SOP (start of packet)
 //                   [3]   EOP (end of packet)
-//                   [7:4] sub-command / word index high
+//                   [7:4] sub-command (CH0: F=frame_start; CH1: 0=TRAM,1=PAL,2=XLAT,3=LUT,4=SD_ADDR,5=SD_DATA,6=CTRL)
 //   cart_tran_bank2[7:0] + cart_tran_bank3[7:0] (dir follows BUS_DIR):
 //     BUS_DATA[15:0] (16-bit synchronous payload @ 31.97 MHz = 63.9 MB/s)
 //
@@ -20,7 +20,7 @@
 
 module m2_cart_bus (
 	input  wire        clk_cart,       // 31.97 MHz bus clock
-	input  wire        clk_sys,        // 79.92 MHz m2_raster3d domain
+	input  wire        clk_sys,        // 73.77 MHz m2_raster3d domain
 	input  wire        clk_mem,        // 95.91 MHz 2D RAM/SDRAM domain
 	input  wire        rst_n,
 
@@ -65,14 +65,14 @@ module m2_cart_bus (
 	output reg  [12:0] q_u1   = 13'd0, q_v1  = 13'd0,
 	output reg  [12:0] q_u2   = 13'd0, q_v2  = 13'd0,
 	output reg  [12:0] q_u3   = 13'd0, q_v3  = 13'd0,
-	output reg  [25:0] q_tex  = 26'd0,
+	output reg  [26:0] q_tex  = 27'd0,
 	output reg   [1:0] q_uvs  = 2'd0,
 	output reg         q_mipz = 1'b0,
 	output reg         q_end  = 1'b0,
 	output reg   [3:0] q_tag  = 4'd0,
 	output reg         frame_start_cart = 1'b0,
 
-	// ---- CH1: 2D & LUT writes (clk_sys domain) -----------------------------
+	// ---- CH1: 2D, LUT & Live Texture/Char SDRAM writes (clk_sys domain) ----
 	output reg         tram_we   = 1'b0,
 	output reg  [14:0] tram_addr = 15'd0,
 	output reg  [15:0] tram_din  = 16'd0,
@@ -86,6 +86,14 @@ module m2_cart_bus (
 	output reg   [1:0] lut_sel   = 2'd0,
 	output reg  [12:0] lut_addr  = 13'd0,
 	output reg  [15:0] lut_data  = 16'd0,
+
+	// Live Texture Sheet (TEXS0/TEXS1) & 2D Char RAM burst writes -> SDRAM Port 5
+	output reg         sd_wreq   = 1'b0,
+	output reg  [25:1] sd_waddr  = 25'd0,
+	output reg  [15:0] sd_wdin   = 16'd0,
+	input  wire        sd_wack,
+	output reg         tex_inval_cart  = 1'b0,
+	output reg         char_inval_cart = 1'b0,
 
 	// ---- CH2: 48 kHz Stereo PCM (clk_sys domain -> sound_i2s) --------------
 	output reg  [15:0] audio_l   = 16'd0,
@@ -116,19 +124,20 @@ module m2_cart_bus (
 	reg [2:0]  vs_sync_c = 3'd0;
 	wire       vs_pulse_c = vs_sync_c[2] ^ vs_sync_c[1];
 
-	// Bus turnaround FSM on clk_cart (clean 1-cycle Hi-Z turnaround on DIR flip)
+	// Bus turnaround FSM on clk_cart (clean Hi-Z turnaround on DIR flip, latched VSync)
 	localparam [2:0] B_RX = 3'd0, B_TA_TX = 3'd1, B_TX0 = 3'd2, B_TX1 = 3'd3,
 	                 B_TX2 = 3'd4, B_TX3 = 3'd5, B_TX4 = 3'd6, B_TA_RX = 3'd7;
-	reg [2:0]  b_st     = B_RX;
-	reg        dir_tx   = 1'b0;
-	reg        oe_data  = 1'b0;
-	reg  [7:0] tx_hdr   = 8'd0;
-	reg [15:0] tx_data  = 16'd0;
-	reg        vs_out   = 1'b0;
-	reg [31:0] key_c    = 32'd0, joy_c = 32'd0;
-	reg [15:0] trg_c    = 16'd0;
+	reg [2:0]  b_st      = B_RX;
+	reg        vs_pend_c = 1'b0;
+	reg        dir_tx    = 1'b0;
+	reg        oe_data   = 1'b0;
+	reg  [7:0] tx_hdr    = 8'd0;
+	reg [15:0] tx_data   = 16'd0;
+	reg        vs_out    = 1'b0;
+	reg [31:0] key_c     = 32'd0, joy_c = 32'd0;
+	reg [15:0] trg_c     = 16'd0;
 
-	// RX FIFO (clk_cart -> clk_sys): 512 x 24 bits {hdr[7:0], data[15:0]}
+	// RX FIFO (clk_cart -> clk_sys): 256 x 24 bits {hdr[7:0], data[15:0]}
 	wire [23:0] rx_din = {cart_tran_bank1, cart_tran_bank2, cart_tran_bank3};
 	wire        rx_wr  = (b_st == B_RX) && cart_tran_pin31 && !rx_full;
 	wire [23:0] rx_dout;
@@ -153,11 +162,13 @@ module m2_cart_bus (
 		.aclr(!rst_n), .eccstatus(), .rdfull(), .rdusedw(), .wrempty()
 	);
 
-	wire pocket_ready_c = (b_st == B_RX) && (rx_wrusedw < 8'd224);
+	// Pause cartridge TX both when RX FIFO is nearly full AND when waiting to turn bus for CH3
+	wire pocket_ready_c = (b_st == B_RX) && !vs_pend_c && !vs_pulse_c && (rx_wrusedw < 8'd220);
 
 	always @(posedge clk_cart or negedge rst_n) begin
 		if (!rst_n) begin
 			vs_sync_c <= 3'd0;
+			vs_pend_c <= 1'b0;
 			b_st      <= B_RX;
 			dir_tx    <= 1'b0;
 			oe_data   <= 1'b0;
@@ -170,22 +181,25 @@ module m2_cart_bus (
 		end else begin
 			vs_sync_c <= {vs_sync_c[1:0], vs_tog_sys};
 			vs_out    <= vs_pulse_c;
+			if (vs_pulse_c) vs_pend_c <= 1'b1;
+
 			case (b_st)
 				B_RX: begin
 					dir_tx  <= 1'b0;
 					oe_data <= 1'b0;
-					if (vs_pulse_c && !cart_tran_pin31) begin
-						key_c  <= key_lat_sys;
-						joy_c  <= joy_lat_sys;
-						trg_c  <= trg_lat_sys;
-						dir_tx <= 1'b1;
-						b_st   <= B_TA_TX;
+					if ((vs_pend_c || vs_pulse_c) && !cart_tran_pin31) begin
+						vs_pend_c <= 1'b0;
+						key_c     <= key_lat_sys;
+						joy_c     <= joy_lat_sys;
+						trg_c     <= trg_lat_sys;
+						dir_tx    <= 1'b1;
+						b_st      <= B_TA_TX;
 					end
 				end
 				B_TA_TX: begin
-					// 1 turnaround cycle before driving level translators
+					// 1 full Hi-Z turnaround cycle after dir_tx=1 before driving bus
 					oe_data <= 1'b1;
-					tx_hdr  <= 8'b0000_0111; // CH3 SOP
+					tx_hdr  <= 8'b0000_0111; // CH3 SOP, word 0 = key_c[15:0]
 					tx_data <= key_c[15:0];
 					b_st    <= B_TX0;
 				end
@@ -216,7 +230,7 @@ module m2_cart_bus (
 	assign cart_tran_bank3         = oe_data ? tx_data[7:0]  : 8'hzz;
 
 	// -------------------------------------------------------------------------
-	// 2. Packet Demux on clk_sys (CH0: 3D Quads, CH1: 2D/LUT, CH2: PCM Audio)
+	// 2. Packet Demux on clk_sys (CH0: 3D Quads, CH1: 2D/LUT/SDRAM, CH2: PCM)
 	// -------------------------------------------------------------------------
 	wire  [7:0] p_hdr  = rx_dout[23:16];
 	wire [15:0] p_dat  = rx_dout[15:0];
@@ -225,27 +239,36 @@ module m2_cart_bus (
 	wire        p_eop  = p_hdr[3];
 	wire  [3:0] p_sub  = p_hdr[7:4];
 
-	reg [4:0]  q_widx   = 5'd0;
-	reg [1:0]  c1_widx  = 2'd0;
-	reg [3:0]  c1_kind  = 4'd0;
-	reg [15:0] c1_addr  = 16'd0;
-	reg        c2_half  = 1'b0;
-	reg [15:0] c2_left  = 16'd0;
+	reg        q_end_lat  = 1'b0;
+	reg [4:0]  q_widx     = 5'd0;
+	reg [1:0]  c1_widx    = 2'd0;
+	reg [3:0]  c1_kind    = 4'd0;
+	reg [15:0] c1_addr    = 16'd0;
+	reg [25:1] sd_cur     = 25'd0;
+	reg        c2_half    = 1'b0;
+	reg [15:0] c2_left    = 16'd0;
 
-	// Stall RX pop only while holding an unaccepted 3D quad for m2_raster3d
-	assign rx_rd = !rx_empty && !(q_valid && !q_ready);
+	// Stall RX pop while holding an unaccepted 3D quad OR an unacknowledged SDRAM write
+	assign rx_rd = !rx_empty && !(q_valid && !q_ready) && !(sd_wreq && !sd_wack);
 
 	always @(posedge clk_sys or negedge rst_n) begin
 		if (!rst_n) begin
 			cart_detected    <= 1'b0;
 			dbg_rx_words     <= 32'd0;
 			q_valid          <= 1'b0;
+			q_end            <= 1'b0;
 			q_widx           <= 5'd0;
 			frame_start_cart <= 1'b0;
 			tram_we          <= 1'b0;
 			pal_we           <= 1'b0;
 			xlat_we          <= 1'b0;
 			lut_we           <= 1'b0;
+			sd_wreq          <= 1'b0;
+			sd_waddr         <= 25'd0;
+			sd_wdin          <= 16'd0;
+			sd_cur           <= 25'd0;
+			tex_inval_cart   <= 1'b0;
+			char_inval_cart  <= 1'b0;
 			c1_widx          <= 2'd0;
 			c2_half          <= 1'b0;
 			audio_l          <= 16'd0;
@@ -257,18 +280,23 @@ module m2_cart_bus (
 			pal_we           <= 1'b0;
 			xlat_we          <= 1'b0;
 			lut_we           <= 1'b0;
+			tex_inval_cart   <= 1'b0;
+			char_inval_cart  <= 1'b0;
 			audio_stb        <= 1'b0;
-			if (q_valid && q_ready) q_valid <= 1'b0;
+			if (q_valid && q_ready) begin
+				q_valid <= 1'b0;
+				q_end   <= 1'b0;
+			end
+			if (sd_wreq && sd_wack) sd_wreq <= 1'b0;
 
 			if (rx_rd) begin
 				cart_detected <= 1'b1;
 				dbg_rx_words  <= dbg_rx_words + 32'd1;
 
 				case (p_ch)
-					// ---- CH0: 3D Projected Quad (24 x 16-bit words) ----
+					// ---- CH0: 3D Projected Quad (27 x 16-bit words) ----
 					2'd0: begin
 						if (p_sop && p_sub == 4'hF) begin
-							// Control packet: start of new 3D frame list
 							frame_start_cart <= 1'b1;
 							q_tag            <= p_dat[3:0];
 							q_widx           <= 5'd0;
@@ -283,7 +311,7 @@ module m2_cart_bus (
 								5'd6:  q_x3   <= p_dat;
 								5'd7:  q_y3   <= p_dat;
 								5'd8:  q_col[15:0]  <= p_dat;
-								5'd9:  begin q_col[23:16] <= p_dat[7:0]; q_moire <= p_dat[8]; q_mipz <= p_dat[9]; q_uvs <= p_dat[11:10]; q_end <= p_dat[12]; end
+								5'd9:  begin q_col[23:16] <= p_dat[7:0]; q_moire <= p_dat[8]; q_mipz <= p_dat[9]; q_uvs <= p_dat[11:10]; q_end_lat <= p_dat[12]; end
 								5'd10: q_z[15:0]    <= p_dat;
 								5'd11: q_z[31:16]   <= p_dat;
 								5'd12: q_oz0        <= p_dat;
@@ -300,11 +328,12 @@ module m2_cart_bus (
 								5'd23: q_u3         <= p_dat[12:0];
 								5'd24: q_v3         <= p_dat[12:0];
 								5'd25: q_tex[15:0]  <= p_dat;
-								5'd26: q_tex[25:16] <= p_dat[9:0];
+								5'd26: q_tex[26:16] <= p_dat[10:0];
 								default: ;
 							endcase
 							if (p_eop) begin
 								q_valid <= 1'b1;
+								q_end   <= q_end_lat;
 								q_widx  <= 5'd0;
 							end else begin
 								q_widx  <= (p_sop ? 5'd1 : q_widx + 5'd1);
@@ -312,18 +341,44 @@ module m2_cart_bus (
 						end
 					end
 
-					// ---- CH1: 2D Tile / Palette / Xlat / LUT shadow write ----
+					// ---- CH1: 2D Tile / Palette / Xlat / LUT / Live SDRAM Stream ----
 					2'd1: begin
-						if (p_sop) begin
+						if (p_sop && p_sub == 4'd5) begin
+							// Streaming 16-bit SDRAM write burst (auto-incrementing sd_cur)
+							c1_kind  <= 4'd5;
+							c1_widx  <= p_eop ? 2'd0 : 2'd2;
+							sd_wreq  <= 1'b1;
+							sd_waddr <= sd_cur;
+							sd_wdin  <= p_dat;
+							sd_cur   <= sd_cur + 25'd1;
+						end else if (p_sop) begin
 							c1_kind <= p_sub;
 							c1_addr <= p_dat;
 							c1_widx <= 2'd1;
+							if (p_sub == 4'd6) begin
+								// Single-word control pulse: [0]=tex_inval, [1]=char_inval
+								tex_inval_cart  <= p_dat[0];
+								char_inval_cart <= p_dat[1];
+								c1_widx         <= 2'd0;
+							end
+						end else if (c1_widx == 2'd2 && c1_kind == 4'd5) begin
+							// Continuation beat of streaming SDRAM burst
+							sd_wreq  <= 1'b1;
+							sd_waddr <= sd_cur;
+							sd_wdin  <= p_dat;
+							sd_cur   <= sd_cur + 25'd1;
+							if (p_eop) c1_widx <= 2'd0;
 						end else if (c1_widx == 2'd1) begin
 							case (c1_kind)
 								4'd0: begin tram_we <= 1'b1; tram_addr <= c1_addr[14:0]; tram_din <= p_dat; end
 								4'd1: begin pal_we  <= 1'b1; pal_addr  <= c1_addr[11:0]; pal_din  <= p_dat; end
 								4'd2: begin xlat_we <= 1'b1; xlat_addr <= c1_addr[6:0];  xlat_din <= p_dat[7:0]; end
 								4'd3: begin lut_we  <= 1'b1; lut_sel   <= c1_addr[14:13]; lut_addr <= c1_addr[12:0]; lut_data <= p_dat; end
+								4'd4: begin
+									sd_cur          <= {p_dat[8:0], c1_addr};
+									tex_inval_cart  <= p_dat[14];
+									char_inval_cart <= p_dat[15];
+								end
 								default: ;
 							endcase
 							c1_widx <= 2'd0;

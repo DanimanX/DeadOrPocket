@@ -9,7 +9,7 @@
             "description": "Sega Model 2 & Model 2A-CRX hybrid openFPGA core @ 60 fps (Dead or Alive, Virtua Fighter 2, Sega Rally, Daytona USA, Virtua Cop, Desert Tank). Based on alphanu1/sega-model2-mister and SpaceFish.",
             "author": "danimanx",
             "url": "https://github.com/DanimanX/DeadOrPocket",
-            "version": "0.1.0-phase1",
+            "version": "0.2.0-phase2",
             "date_release": "2026-11-20"
         },
         "framework": {

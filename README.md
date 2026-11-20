@@ -10,15 +10,39 @@ Based on the [`alphanu1/sega-model2-mister`](https://github.com/alphanu1/sega-mo
 
 ---
 
-## Phase 1 Milestone — Real `5CEBA4F23C8` Pocket Render Core (100% Timing Closed)
+## Phase 2 Milestone — 30-Pin Cartridge Bus v2 & Full Verilator Co-Simulation (PASS)
 
-The **Phase 1 Analogue Pocket Render Core** ([`src/fpga/`](src/fpga/)) compiles cleanly in **Intel Quartus Prime 25.1 Lite** targeting the Analogue Pocket's Cyclone V FPGA (`5CEBA4F23C8`) with **0 errors, 0 timing warnings, and 0.000 ns TNS across all four PVT corners (`Slow 85°C`, `Slow 0°C`, `Fast 85°C`, `Fast 0°C`)**:
+Both sides of the hybrid **Compute Cartridge ↔ 30-Pin Analogue Pocket Cartridge Bus ↔ Pocket Render Core** ([`src/cart_rtl/m2_cart_host.sv`](src/cart_rtl/m2_cart_host.sv) ↔ [`src/fpga/pocket_rtl/m2_cart_bus.sv`](src/fpga/pocket_rtl/m2_cart_bus.sv)) have been verified end-to-end in **Verilator 5.054** AND re-verified in **Quartus Prime 25.1 Lite (`5CEBA4F23C8`)** with **0 errors and `0.000 ns` TNS across all 4 PVT corners**:
 
-| Metric (`5CEBA4F23C8`) | Verified Phase 1 Fit | Pocket Ceiling | Utilization |
+<p align="center">
+  <img src="docs/phase2_cosim_frame.png" alt="DeadOrPocket Phase 2 Verilator Co-Simulation Output (496x384 RGB24)" width="496">
+</p>
+<p align="center"><em>Real 496×384 RGB24 frame rendered by unmodified <code>m2_raster3d</code> + Dual Cellular PSRAM Ping-Pong FB + <code>m2_video</code> from 3D shaded &amp; live SDRAM-textured quads streamed across the virtual 30-pin Pocket Cartridge Bus (0 bus contention, 0 JEDEC SDRAM violations).</em></p>
+
+### Phase 2 Verilator Co-Simulation Scorecards ([`sim/`](sim/))
+
+| Co-Simulation Benchmark | Scope Exercised | Verified Result |
+|---|---|---|
+| **1. Full 4-Channel Render Co-Sim (`make -C sim run_bus`)** | `m2_cart_host` ↔ 30-pin bus ↔ `m2_cart_bus` ↔ `m2_raster3d` (bilinear+mip+FTB) + `m2_fb_psram` + 2×`psram_phy` + 2×`psram_cell_model` + `m2_video` + `m2_char_cache` + `m2_sdram` (8p) + JEDEC `sdram_model` | **PASS** · `7,445 TX / 7,445 RX` words · **0 contention** · **0 JEDEC SDRAM violations** (`1,040 reads`, `1,024 writes`) · **2,441/2,441 CH2 PCM bit-exact** · **3/3 CH3 inputs bit-exact** · **189,115 / 190,080 3D pixels rendered** |
+| **2. Real Sega Model 2A-CRX ROM Boot (`make -C sim run_m2a`)** | Real Intel `i960_top` (`FP_SUBN=2, RC_RING=1, FR=1, F2A=1`) + `m2_cpu_bridge` booting real **`vf2.rom` (*Virtua Fighter 2*)** → live CPU write snooper → `m2_cart_host` → 30-pin bus → `m2_cart_bus` → Pocket `u_tram`/`u_pal`/`m2_video` | **PASS** · **1,698,138 i960 accesses** (`0 traps`, `0 halts`) · **80,121 live CH1 video writes** (`30,738` TRAM, `5,056` PAL, `44,135` Char/Tex SDRAM) · `145,547 TX / 145,547 RX` words · **0 contention** · **12/12 CH3 VBlank roundtrips** |
+| **3. Real *Dead or Alive* (`doaab.rom`) i960 Boot Check** | Real 90.75 MB `doaab.rom` on `i960_top` (`FR=1, F2A=1`) + `m2_cpu_bridge` (`BOARD_2A=1, prog_ext=1`) | **3,185,370 i960 accesses**, `0 traps`, `0 halts`, `30/30` CH3 VBlank input roundtrips, **0 contention** |
+
+#### Real Silicon Bugs Caught & Fixed by Phase 2 Co-Simulation
+1. **Head-of-line `frame_start` deadlock:** Driving `u_raster3d.frame_start` directly from Pocket's `vblank_pulse_sys` (instead of gating it behind `u_rx_fifo`) eliminated a deadlock when `m2_raster3d` paused `q_ready`.
+2. **Stuck `q_end` pulse:** `m2_cart_bus` now clears `q_end` on the cycle `q_valid && q_ready` completes so `m2_raster3d` never prematurely closes subsequent frames with 0 quads.
+3. **27-bit `q_tex` (`TEXLUT=1` `in_vx`) & live Texture/Char SDRAM streaming:** Widened `q_tex` to `[26:0]` (fitting in spare bits of word 26 with zero extra bus words) and added auto-coalesced CH1 burst streaming (`sub=4/5/6`) into Pocket SDRAM Port 5 (`TEXS0`, `TEXS1`, `CHAR_RAM`) with automatic `tex_inval` / `char_cache` line invalidation.
+
+---
+
+## Verified `5CEBA4F23C8` Silicon Fit & 4-Corner Timing (`v0.2.0-phase2`)
+
+Compiled in **Intel Quartus Prime 25.1 Lite** (`HIGH PERFORMANCE EFFORT`, `SYNTH_TIMING_DRIVEN_SYNTHESIS ON`) targeting the Analogue Pocket's Cyclone V `5CEBA4F23C8` — **0 errors, 0.000 ns TNS across all four PVT corners (`Slow 85°C`, `Slow 0°C`, `Fast 85°C`, `Fast 0°C`)**:
+
+| Metric (`5CEBA4F23C8`) | Verified Phase 2 Fit | Pocket Ceiling | Utilization |
 |---|---:|---:|---:|
-| **Logic Utilization (ALMs)** | **10,373** | 18,480 | **56%** |
-| **Registers** | **14,149** | — | — |
-| **M10K RAM Blocks** | **303** (2,735,996 bits) | 308 (3,153,920 bits) | **98% (87% bits)** |
+| **Logic Utilization (ALMs)** | **10,563** | 18,480 | **57%** |
+| **Registers** | **14,495** | — | — |
+| **M10K RAM Blocks** | **303** (2,740,092 bits) | 308 (3,153,920 bits) | **98% (87% bits)** |
 | **DSP Blocks** | **55** | 66 | **83%** |
 | **PLLs** | **2** (`m2_pll` + `m2_audio_pll`) | 4 | **50%** |
 | **External Memories Used** | `dram_*` (64 MB) + `cram0_*` (16 MB) + `cram1_*` (16 MB) | + 256 KB Async SRAM free | **Zero DDR3** |
@@ -27,21 +51,12 @@ The **Phase 1 Analogue Pocket Render Core** ([`src/fpga/`](src/fpga/)) compiles 
 
 | Clock Domain | Frequency | Slow 85°C Setup | Slow 0°C Setup | Slow 0°C Hold | TNS (All 4 Corners) |
 |---|---:|---:|---:|---:|---:|
-| `clk_sys` (`m2_raster3d` + FB + Cart Bus) | **73.774 MHz** | `+0.752 ns` | `+0.296 ns` | `+0.122 ns` | **0.000 ns** |
-| `clk_mem` (`m2_sdram` 8p + 2×`psram_phy` + `m2_video`) | **95.906 MHz** | `+1.561 ns` | `+1.176 ns` | `+0.166 ns` | **0.000 ns** |
-| `clk_cart` (30-pin 16-bit Cart Bus → **63.9 MB/s**) | **31.969 MHz** | `+25.389 ns` | `+25.272 ns` | `+0.491 ns` | **0.000 ns** |
-| `clk_pix` (APF Video 496×384 @ 57.47 Hz) | **15.984 MHz** | `+5.069 ns` | `+5.256 ns` | `+0.589 ns` | **0.000 ns** |
-| `clk_74a` (APF Bridge / `m2_pk_io`) | **74.250 MHz** | `+4.133 ns` | `+4.432 ns` | `+0.354 ns` | **0.000 ns** |
-| `audio_mclk` (48 kHz Stereo I2S DAC) | **12.288 MHz** | `+76.699 ns` | `+76.785 ns` | `+0.325 ns` | **0.000 ns** |
-
-### What Is Included in Phase 1 (`Release/DeadOrPocket_Pocket_v0.1.0-phase1.zip`)
-
-- **Unmodified Full-Fidelity 3D Engine (`m2_raster3d`):** Bilinear texture filtering, mip-mapping, 4 concurrent texel fetch ports, and FTB running natively on the Pocket's `5CEBA4F23C8`.
-- **Pixel-Exact 2D Tilemap Pipeline (`m2_video` + `m2_char_cache`):** 4-line scanline ring buffer, 64 KB dual-clock Tile RAM (`u_tram`), 16 KB dual-clock Palette RAM (`u_pal`), and 1K-line character cache backed by 64 MB SDR SDRAM.
-- **Zero-Contention Dual-PSRAM Ping-Pong Framebuffer (`m2_fb_psram.sv` + 2× `psram_phy.sv`):** Replaces MiSTer's 32-bit DDR3 framebuffer by packing `m2_raster3d`'s 64-bit 2-pixel beats into 2×16-bit `{hit, RGB555}` words across `cram0_*` (Bank A) and `cram1_*` (Bank B) with zero modifications to `m2_raster3d`.
-- **30-Pin Cartridge Slot Synchronous Bus PHY (`m2_cart_bus.sv`):** 16-bit @ 31.97 MHz (**63.9 MB/s**) packet-switched link (`CH0` 3D quads, `CH1` 2D/LUT/texture writes, `CH2` 48 kHz stereo PCM, `CH3` VBlank controller/status TX) with clean hardware level-translator turnaround.
-- **Built-in 57.47 Hz 3D Hardware Self-Test (`m2_demo_gen.sv`):** Automatically runs animated 3D shaded quads through the real `m2_raster3d` → Dual-PSRAM FB → APF 496×384 video pipeline on standalone Analogue Pocket hardware when no Compute Cartridge is connected.
-- **SpaceFish-Style openFPGA Assets:** Custom monochrome cover (`banner.png`), 36×36 16-bit LE core icon (`icon.bin`), and 521×165 rotated platform artwork (`model2.bin`).
+| `clk_sys` (`m2_raster3d` + FB + Cart Bus) | **73.774 MHz** | `+0.587 ns` | `+0.149 ns` | `+0.151 ns` | **0.000 ns** |
+| `clk_mem` (`m2_sdram` 8p + 2×`psram_phy` + `m2_video`) | **95.906 MHz** | `+1.607 ns` | `+1.121 ns` | `+0.159 ns` | **0.000 ns** |
+| `clk_cart` (30-pin 16-bit Cart Bus → **63.9 MB/s**) | **31.969 MHz** | `+25.610 ns` | `+25.643 ns` | `+0.538 ns` | **0.000 ns** |
+| `clk_pix` (APF Video 496×384 @ 57.47 Hz) | **15.984 MHz** | `+5.783 ns` | `+5.886 ns` | `+0.584 ns` | **0.000 ns** |
+| `clk_74a` (APF Bridge / `m2_pk_io`) | **74.250 MHz** | `+6.579 ns` | `+6.667 ns` | `+0.368 ns` | **0.000 ns** |
+| `audio_mclk` (48 kHz Stereo I2S DAC) | **12.288 MHz** | `+76.101 ns` | `+76.423 ns` | `+0.325 ns` | **0.000 ns** |
 
 ---
 
@@ -55,8 +70,8 @@ The Analogue Pocket's main Intel Cyclone V FPGA (`5CEBA4F23C8`) provides **18,48
 
 - **A monolithic single-chip port is physically impossible:** even with the entire MiSTer framework (`sys/`) stripped out, the core requires **~34,400–35,100 ALMs (~1.9× the Pocket)**, **~420+ M10K (~1.4×)**, and **~71 DSP (~1.1×)**.
 - **The "Compute-in-Cartridge / Render-in-Pocket" split fits cleanly at full 60 fps (57.52 Hz) with zero visual or audio compromises:**
-  - **Analogue Pocket (`5CEBA4F23C8`)** runs the complete 3D + 2D video pipeline (`m2_raster3d` + `m2_video`), stores live 2×1 MB texture sheets (`TEXS0`/`TEXS1`) and 2D char RAM in its **64 MB SDR SDRAM**, double-buffers the 3D framebuffer in **ping-pong across both 16 MB Cellular PSRAMs (`cram0`/`cram1`)**, and keeps all **256 KB of Async SRAM (`sram_*`)** free for future expansion — proven in real Quartus 25.1 routing at **56% ALMs (10,373 / 18,480)**, **98% M10K (303 / 308)**, and **83% DSP (55 / 66)**.
-  - **Compute Cartridge** (plugged into the Pocket's 30-pin cartridge slot) runs all game computation and audio (`i960KB + FPU`, `MB86233 TGP`, `m2_geometry`, `Sound Board M2/2A`, and `m2_ioz80`), streaming only **~14.2 MB/s peak** of projected quads, 2D deltas, and 48 kHz stereo PCM over the **16-bit synchronous bus @ 31.97 MHz (63.9 MB/s)**.
+  - **Analogue Pocket (`5CEBA4F23C8`)** runs the complete 3D + 2D video pipeline (`m2_raster3d` + `m2_video`), stores live 2×1 MB texture sheets (`TEXS0`/`TEXS1`) and 2D char RAM in its **64 MB SDR SDRAM**, double-buffers the 3D framebuffer in **ping-pong across both 16 MB Cellular PSRAMs (`cram0`/`cram1`)**, and keeps all **256 KB of Async SRAM (`sram_*`)** free — proven in real Quartus 25.1 routing at **57% ALMs (10,563 / 18,480)**, **98% M10K (303 / 308)**, and **83% DSP (55 / 66)**.
+  - **Compute Cartridge** (plugged into the Pocket's 30-pin cartridge slot) runs all game computation and audio (`i960KB + FPU`, `MB86233 TGP`, `m2_geometry`, `Sound Board M2/2A`, and `m2_ioz80`), streaming only **~14.2 MB/s peak** of projected quads, 2D/texture deltas, and 48 kHz stereo PCM over the **16-bit synchronous bus @ 31.97 MHz (63.9 MB/s)**.
 
 ```mermaid
 flowchart LR
@@ -66,7 +81,7 @@ flowchart LR
         TGP["Fujitsu MB86233 TGP<br/>2,945 ALMs · 1 DSP"]
         GEO["m2_geometry 3D<br/>6,200 ALMs · 3 DSP"]
         SND["Sound Board M2 / 2A<br/>68000 + SCSP / YM+MPCM<br/>4,449 ALMs · 6 DSP"]
-        IO["cpu_bridge + Z80 I/O<br/>(M2: 1,177 ALMs)"]
+        IO["cpu_bridge + m2_cart_host<br/>+ Z80 I/O (M2)"]
         CSDRAM[("Cartridge SDRAM<br/>Prog+Data+Polys+Audio<br/>(DOA: 57.75 MB)")]
         I960 <--> TGP
         I960 --> GEO
@@ -76,21 +91,21 @@ flowchart LR
         SND <--> CSDRAM
     end
 
-    subgraph BUS["Pocket Cartridge Slot · 30 Pins · 16-bit @ 31.97 MHz (63.9 MB/s)"]
+    subgraph BUS["Pocket Cartridge Slot · 30 Pins · 16-bit @ 31.97 MHz (63.9 MB/s · 0 Contention Verified)"]
         CH0["CH0: 3D Quads (9.42 MB/s)"]
-        CH1["CH1: 2D Tile/Char/Pal/Tex (≤4.6 MB/s)"]
+        CH1["CH1: 2D Tile/Pal/LUT + TEXS0/1 Stream"]
         CH2["CH2: 48 kHz Stereo PCM (0.19 MB/s)"]
         CH3["CH3: Inputs + VSync (<0.01 MB/s)"]
     end
 
-    subgraph POCKET["Analogue Pocket · Cyclone V 5CEBA4F23C8 (Verified: 10,373 ALMs · 56% · 55 DSP · 0.000 TNS)"]
+    subgraph POCKET["Analogue Pocket · Cyclone V 5CEBA4F23C8 (Verified: 10,563 ALMs · 57% · 55 DSP · 0.000 TNS)"]
         direction TB
         R3D["Full m2_raster3d<br/>Bilinear + Mip + 4 Tex Ports<br/>73.77 MHz (0.000 TNS)"]
         V2D["m2_video + char_cache<br/>64KB Tram + 16KB Pal<br/>95.91 MHz"]
-        APF["APF + m2_pk_io + sound_i2s<br/>+ 2x psram_phy + m2_sdram 8p<br/>+ m2_cart_bus + m2_demo_gen"]
+        APF["APF + m2_pk_io + sound_i2s<br/>+ 2x psram_phy + m2_sdram 8p<br/>+ m2_cart_bus v2 + m2_demo_gen"]
         PDRAM[("64 MB SDRAM<br/>TEXS0/1 + 2D Chars")]
         PCRAM[("32 MB PSRAM<br/>CRAM0/1 FB Ping-Pong")]
-        PSRAM[("256 KB Async SRAM<br/>Free (Phase 2 Reserve)")]
+        PSRAM[("256 KB Async SRAM<br/>Free Reserve")]
         R3D <--> PDRAM
         R3D <--> PCRAM
         V2D <--> PDRAM
@@ -107,9 +122,9 @@ flowchart LR
 
 ---
 
-## Installation & Testing (Phase 1 Self-Test on Analogue Pocket)
+## Installation & Testing (Analogue Pocket MicroSD)
 
-1. Download [`Release/DeadOrPocket_Pocket_v0.1.0-phase1.zip`](Release/DeadOrPocket_Pocket_v0.1.0-phase1.zip).
+1. Download [`Release/DeadOrPocket_Pocket_v0.2.0-phase2.zip`](Release/DeadOrPocket_Pocket_v0.2.0-phase2.zip).
 2. Extract its contents directly to the root of your Analogue Pocket MicroSD card:
    ```text
    /
@@ -129,46 +144,29 @@ flowchart LR
        │   └── model2.bin
        └── model2.json
    ```
-3. On your Analogue Pocket, navigate to **openFPGA → Sega Model 2 → DeadOrPocket → 3D Hardware Self-Test** to verify the live 57.47 Hz `m2_raster3d` + Dual-PSRAM Ping-Pong Framebuffer pipeline directly on hardware (no ROMs required).
+3. On your Analogue Pocket, launch **openFPGA → Sega Model 2 → DeadOrPocket → 3D Hardware Self-Test** to run the live 57.47 Hz `m2_raster3d` + Dual-PSRAM Ping-Pong Framebuffer pipeline directly on hardware (no ROMs required).
 
 ---
 
-## Building from Source & Verifying ROM Sets
+## Building from Source & Running Verilator Co-Simulations
 
-Requirements: Intel Quartus Prime 25.1 Lite with Cyclone V (`5CEBA4F23C8`) and Python 3 (with Pillow for asset regeneration).
+Requirements: Intel Quartus Prime 25.1 Lite (`5CEBA4F23C8`), Verilator 5.x, `g++`, `make`, and Python 3 (with Pillow).
 
 ```bash
-# 1. Compile the full Analogue Pocket Render Core (map + fit + asm + sta)
+# 1. Compile the Analogue Pocket Render Core (map + fit + asm + sta)
 ./tools/build_pocket.sh
 
-# 2. Generate bit-reversed bitstream.rbf_r and Release/DeadOrPocket_Pocket_v0.1.0-phase1.zip
-python3 tools/package_pocket.py
+# 2. Generate bit-reversed bitstream.rbf_r and Release/DeadOrPocket_Pocket_v0.2.0-phase2.zip
+python3 tools/package_pocket.py --version v0.2.0-phase2
 
-# 3. (Optional) Verify local MAME .zip ROM sets placed in roms/ against MRA CRC32s
+# 3. Run Phase 2 full 4-channel 30-pin Bus + m2_raster3d + Dual PSRAM + SDRAM Verilator co-sim
+make -C sim run_bus
+
+# 4. (Optional) Verify local MAME .zip ROM sets in roms/ and run real Model 2A i960 ROM boot co-sim
 python3 tools/build_rom.py --verify-all
+python3 tools/build_rom.py --mra "Virtua Fighter 2 (Version 2.1).mra" --out roms/out
+make -C sim run_m2a
 ```
-
----
-
-## Phase 0 Measured Synthesis Results (`5CEBA4F23C8` · Quartus Prime 25.1 Lite)
-
-Measured directly via [`phase0_bench/run_phase0.py`](phase0_bench/run_phase0.py) (full raw JSON in [`phase0_bench/phase0_parsed.json`](phase0_bench/phase0_parsed.json)):
-
-| RTL Subsystem | Branch | Est. ALMs | Registers | Block Mem Bits | Est. M10K | DSP | Hybrid Side |
-|---|---|---:|---:|---:|---:|---:|---|
-| `i960_top` (`FP_SUBN=2, RC_RING=1, DC=64`) | `model2a` | **8,387** | 4,519 | 98,304 | 13 | 7 | Cartridge |
-| `m2_geometry` | `model2a` | **6,200** | 8,815 | 10,532 | 2 | 3 | Cartridge |
-| `m2_copro` (MB86233 TGP) | `model2a` / `main` | **2,945** / 2,644 | 2,863 | 164,098 | 19 / 12 | 1 | Cartridge |
-| `m2_2a_sound` (68k + SCSP + DSP) | `model2a` | **4,449** | 3,838 | 228,128 | 40 | 6 | Cartridge (2A) |
-| `m2_sound_board` (68k + YM3438 + 2×MPCM) | `main` | **4,307** | 4,130 | 179,571 | 24 | 6 | Cartridge (M2) |
-| `m2_ioz80` (TV80 I/O, Model 2 only) | `main` | **1,177** | 783 | 196,608 | 24 | 0 | Cartridge (M2) |
-| `m2_cpu_bridge` | `model2a` | **893** | 911 | 169,984 | 17 | 0 | Cartridge |
-| `m2_raster3d` (**full: bilinear + mip + FTB**) | `model2a` | **8,228** | 9,724 | 1,944,156 | 208 | 52 | **Pocket** |
-| `m2_video` (2D tilemap, 4-line ring) | `model2a` | **1,598** | 2,296 | 122,880 | 16 | 2 | **Pocket** |
-| `m2_char_cache` (2K lines) | `model2a` | **202** | 288 | 143,360 | 15 | 0 | **Pocket** |
-| `m2_sdram` (8 ports) | `model2a` | **862** | 1,485 | 0 | 0 | 0 | **Pocket** |
-
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full hardware specification: physical cartridge pinout (`apf_top.v`), bus protocol & bandwidth budget, 5V/200 mA power design, candidate cartridge FPGAs (`5CEBA5/7`, `GW5AST-60`, `ECP5-85F`), Cyclone V PLL clock synthesis, and memory maps.
 
 ---
 
@@ -184,8 +182,8 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full hardware specifi
 ## Roadmap
 
 - [x] **Phase 0:** Feasibility audit against SpaceFish + real Quartus Prime 25.1 Lite (`5CEBA4F23C8`) synthesis benchmark across all 16 Model 2 and Model 2A-CRX subsystems.
-- [x] **Phase 1 — Pocket Render Core (`src/fpga/`):** Full Analogue Pocket `5CEBA4F23C8` render core (`m2_raster3d` + `m2_video` + Dual-PSRAM Ping-Pong FB + 8-port SDRAM + 30-pin 16-bit Cart Bus PHY + built-in 3D Self-Test + SpaceFish APF assets), **fitted at 56% ALMs / 98% M10K / 83% DSP with 100% 4-corner timing closure (`0.000 ns TNS`)** and packaged as `DeadOrPocket_Pocket_v0.1.0-phase1.zip`.
-- [ ] **Phase 2 — Cartridge Bus Protocol & Verilator Co-Simulation:** Implement the Compute Cartridge RTL TX/RX side (`m2_cart_host.sv`) and co-simulate real Model 2 / Model 2A-CRX ROMs (*Dead or Alive*, *Virtua Fighter 2*, *Sega Rally*, *Daytona USA*) end-to-end across the virtual 30-pin cartridge bus into `m2_pocket_top`.
+- [x] **Phase 1 — Pocket Render Core (`src/fpga/`):** Full Analogue Pocket `5CEBA4F23C8` render core (`m2_raster3d` + `m2_video` + Dual-PSRAM Ping-Pong FB + 8-port SDRAM + 30-pin Cart Bus PHY + built-in 3D Self-Test + Kasumi SpaceFish APF assets), fitted with **100% 4-corner timing closure (`0.000 ns TNS`)**.
+- [x] **Phase 2 — Cartridge Bus Protocol v2 & Verilator Co-Simulation (`src/cart_rtl/`, `sim/`):** Implemented symmetric `m2_cart_host.sv` + upgraded `m2_cart_bus.sv` (auto-coalesced live Texture/Char SDRAM streaming, 27-bit `q_tex`, latched VBlank CH3 turnaround), verified end-to-end in Verilator across all 4 channels (0 contention, 0 JEDEC SDRAM violations, 189k+ 3D pixels rendered, real *Virtua Fighter 2* & *Dead or Alive* i960 ROM boot), and re-verified `5CEBA4F23C8` Quartus 25.1 timing closure (`57% ALMs`, `98% M10K`, `0.000 ns TNS`).
 - [ ] **Phase 3 — Compute Cartridge Hardware Prototype:** Finalize target cartridge FPGA (`5CEBA5/7`, `GW5AST-60`, or `ECP5-85F`), design the 32-pin Pocket cartridge PCB with 64–128 MB SDRAM, high-efficiency buck power stage, and strict 3.3V bus I/O.
 - [ ] **Phase 4 — Hardware Bring-Up (Model 2A & Model 2):** Full 57.52 Hz hardware verification across *Dead or Alive*, *Virtua Fighter 2*, *Sega Rally*, and *Daytona USA* (handheld & Dock).
 

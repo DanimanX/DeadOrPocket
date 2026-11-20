@@ -391,7 +391,7 @@ module m2_pocket_top (
 	wire [31:0] cq_z;
 	wire [15:0] cq_oz0, cq_oz1, cq_oz2, cq_oz3, cq_frac;
 	wire [12:0] cq_u0, cq_v0, cq_u1, cq_v1, cq_u2, cq_v2, cq_u3, cq_v3;
-	wire [25:0] cq_tex;
+	wire [26:0] cq_tex;
 	wire  [1:0] cq_uvs;
 	wire  [3:0] cq_tag;
 
@@ -407,6 +407,10 @@ module m2_pocket_top (
 	wire [15:0] lut_data;
 	wire [15:0] cart_audio_l, cart_audio_r;
 	wire        cart_audio_stb;
+	wire        cart_sd_wreq, cart_tex_inval, cart_char_inval;
+	wire [25:1] cart_sd_waddr;
+	wire [15:0] cart_sd_wdin;
+	wire        cart_sd_wack;
 
 	wire        r3d_q_ready;
 
@@ -449,8 +453,61 @@ module m2_pocket_top (
 		.pal_we(pal_we), .pal_addr(pal_waddr), .pal_din(pal_wdin),
 		.xlat_we(xlat_we), .xlat_addr(xlat_waddr), .xlat_din(xlat_wdin),
 		.lut_we(lut_we), .lut_sel(lut_sel), .lut_addr(lut_addr), .lut_data(lut_data),
+		.sd_wreq(cart_sd_wreq), .sd_waddr(cart_sd_waddr), .sd_wdin(cart_sd_wdin),
+		.sd_wack(cart_sd_wack), .tex_inval_cart(cart_tex_inval), .char_inval_cart(cart_char_inval),
 		.audio_l(cart_audio_l), .audio_r(cart_audio_r), .audio_stb(cart_audio_stb)
 	);
+
+	// Zero-M10K CDC bridge: Cartridge live Texture/Char writes (clk_sys -> clk_mem SDRAM Port 5)
+	reg        csdw_tog_s = 1'b0, csdw_pend_s = 1'b0;
+	reg [25:1] csdw_addr_s = 25'd0;
+	reg [15:0] csdw_din_s  = 16'd0;
+	reg        csdw_ack_m  = 1'b0;
+	reg [2:0]  csdw_ack_s  = 3'd0;
+	assign cart_sd_wack = csdw_pend_s && (csdw_ack_s[2] ^ csdw_ack_s[1]);
+	always @(posedge clk_sys or negedge core_rst_n) begin
+		if (!core_rst_n) begin
+			csdw_tog_s  <= 1'b0;
+			csdw_pend_s <= 1'b0;
+			csdw_addr_s <= 25'd0;
+			csdw_din_s  <= 16'd0;
+			csdw_ack_s  <= 3'd0;
+		end else begin
+			csdw_ack_s <= {csdw_ack_s[1:0], csdw_ack_m};
+			if (cart_sd_wack) begin
+				csdw_pend_s <= 1'b0;
+			end else if (cart_sd_wreq && !csdw_pend_s) begin
+				csdw_addr_s <= cart_sd_waddr;
+				csdw_din_s  <= cart_sd_wdin;
+				csdw_tog_s  <= ~csdw_tog_s;
+				csdw_pend_s <= 1'b1;
+			end
+		end
+	end
+
+	reg [2:0]  csdw_req_m = 3'd0;
+	reg        p5_req_r   = 1'b0;
+	reg [25:1] p5_addr_r  = 25'd0;
+	reg [15:0] p5_din_r   = 16'd0;
+	always @(posedge clk_mem or negedge vid_rst_n) begin
+		if (!vid_rst_n) begin
+			csdw_req_m <= 3'd0;
+			p5_req_r   <= 1'b0;
+			p5_addr_r  <= 25'd0;
+			p5_din_r   <= 16'd0;
+			csdw_ack_m <= 1'b0;
+		end else begin
+			csdw_req_m <= {csdw_req_m[1:0], csdw_tog_s};
+			if (p5_req_r && p_ack[5]) begin
+				p5_req_r   <= 1'b0;
+				csdw_ack_m <= ~csdw_ack_m;
+			end else if (!p5_req_r && (csdw_req_m[2] ^ csdw_req_m[1])) begin
+				p5_addr_r <= csdw_addr_s;
+				p5_din_r  <= csdw_din_s;
+				p5_req_r  <= 1'b1;
+			end
+		end
+	end
 
 	wire use_demo = demo_mode && !cart_detected;
 
@@ -566,7 +623,7 @@ module m2_pocket_top (
 		.clk          ( clk_sys ),
 		.clk_mem      ( clk_mem ),
 		.rst_n        ( core_rst_n ),
-		.frame_start  ( use_demo ? d_frame_start : c_frame_start ),
+		.frame_start  ( use_demo ? d_frame_start : vblank_pulse_sys ),
 		.q_valid      ( use_demo ? dq_valid : cq_valid ),
 		.q_ready      ( r3d_q_ready ),
 		.q_x0         ( use_demo ? dq_x0 : cq_x0 ),
@@ -593,7 +650,7 @@ module m2_pocket_top (
 		.q_v2         ( use_demo ? 13'd0 : cq_v2 ),
 		.q_u3         ( use_demo ? 13'd0 : cq_u3 ),
 		.q_v3         ( use_demo ? 13'd0 : cq_v3 ),
-		.q_tex        ( use_demo ? 26'd0 : cq_tex ),
+		.q_tex        ( use_demo ? 27'd0 : cq_tex ),
 		.q_uvs        ( use_demo ? 2'd0  : cq_uvs ),
 		.q_mipz       ( use_demo ? 1'b1  : cq_mipz ),
 		.q_end        ( use_demo ? dq_end : cq_end ),
@@ -608,7 +665,7 @@ module m2_pocket_top (
 		.scan_hit     ( scan_hit ),
 		.tex_base0    ( 25'h000_0000 ),
 		.tex_base1    ( 25'h020_0000 ),
-		.tex_inval    ( 1'b0 ),
+		.tex_inval    ( cart_tex_inval ),
 		.tex_bilinear ( tex_bilinear ),
 		.tex_pxk      ( 2'd2 ),
 		.tex_mip_mode ( tex_mip_mode ),
@@ -702,6 +759,9 @@ module m2_pocket_top (
 	wire        cc_m_req;
 	wire [17:0] cc_m_addr;
 
+	// Auto-invalidate char_cache line when Cartridge streams a write into CHAR_BASE (0x080_0000..0x08F_FFFF)
+	wire p5_char_hit = p5_req_r && p_ack[5] && (p5_addr_r[25:20] == 6'b001000);
+
 	m2_char_cache #(.IDX_BITS(10), .ADDR_BITS(18), .SIBLING(1'b0)) u_char_cache (
 		.clk        ( clk_mem ),
 		.rst_n      ( vid_rst_n ),
@@ -709,8 +769,8 @@ module m2_pocket_top (
 		.v_addr     ( char_addr ),
 		.v_data     ( char_data ),
 		.v_ack      ( char_ack ),
-		.inval      ( 1'b0 ),
-		.inval_idx  ( 10'd0 ),
+		.inval      ( p5_char_hit ),
+		.inval_idx  ( p5_addr_r[11:2] ),
 		.m_req      ( cc_m_req ),
 		.m_addr     ( cc_m_addr ),
 		.m_data     ( p_dout[0] ),
@@ -727,7 +787,7 @@ module m2_pocket_top (
 	assign p_req[2]  = tex_m2_req; assign p_we[2] = 1'b0; assign p_addr[2] = tex_m2_addr; assign p_din[2] = 16'd0; assign p_be[2] = 2'b11; assign p_long[2] = 1'b1;
 	assign p_req[3]  = tex_m3_req; assign p_we[3] = 1'b0; assign p_addr[3] = tex_m3_addr; assign p_din[3] = 16'd0; assign p_be[3] = 2'b11; assign p_long[3] = 1'b1;
 	assign p_req[4]  = tex_m4_req; assign p_we[4] = 1'b0; assign p_addr[4] = tex_m4_addr; assign p_din[4] = 16'd0; assign p_be[4] = 2'b11; assign p_long[4] = 1'b1;
-	assign p_req[5]  = 1'b0; assign p_we[5] = 1'b0; assign p_addr[5] = 25'd0; assign p_din[5] = 16'd0; assign p_be[5] = 2'b00; assign p_long[5] = 1'b0;
+	assign p_req[5]  = p5_req_r;   assign p_we[5] = 1'b1; assign p_addr[5] = p5_addr_r;   assign p_din[5] = p5_din_r; assign p_be[5] = 2'b11; assign p_long[5] = 1'b0;
 	assign p_req[6]  = 1'b0; assign p_we[6] = 1'b0; assign p_addr[6] = 25'd0; assign p_din[6] = 16'd0; assign p_be[6] = 2'b00; assign p_long[6] = 1'b0;
 	assign p_req[7]  = 1'b0; assign p_we[7] = 1'b0; assign p_addr[7] = 25'd0; assign p_din[7] = 16'd0; assign p_be[7] = 2'b00; assign p_long[7] = 1'b0;
 

@@ -1,4 +1,4 @@
-DeadOrPocket v0.1.0-phase1 (Sega Model 2 & Model 2A-CRX Hybrid Core)
+DeadOrPocket v0.2.0-phase2 (Sega Model 2 & Model 2A-CRX Hybrid Core)
 Author: DanimanX
 Upstream: alphanu1/sega-model2-mister (GPL-3.0)
-Phase 1: Pocket Render Core (m2_raster3d + m2_video + Dual PSRAM FB + 16-bit Cart Bus PHY + Built-in 3D Self-Test)
+Phase 2: Verilator Co-Simulated 30-Pin Cart Bus v2 (Live Texture/Char SDRAM Stream + 27-bit q_tex + Dual PSRAM FB + 3D Self-Test)
