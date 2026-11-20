@@ -1,0 +1,941 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Sega Model 1 core for MiSTer FPGA
+// Copyright (C) 2026 alphanu1
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the Free
+// Software Foundation, either version 3 of the License, or (at your option)
+// any later version. See LICENSE for the full text.
+//
+// The coprocessor: mb86233_core plus the board around it.
+//
+// The core has been built and fuzz-verified for weeks; this is the wiring that
+// was missing. From model1.cpp's machine config and model1_m.cpp's handlers —
+// see docs/m2-tgp-integration.md for the full transcription.
+//
+//   AS_PROGRAM  0x000-0x7ff   microcode ROM, 2048 words = 315-5573.bin exactly
+//   AS_DATA     internal RAM, with the two FIFOs forwarded out at 0x0100/0x0400
+//   AS_IO       copro RAM window, four math units, and a 2 MB data-ROM window
+//   AS_RF       LEDs, discarded
+//
+// THE TGP's COPRO RAM RULE IS NOT THE V60's
+//
+// It has FOUR address registers, selected by IO address bits 4:3 — MAME's
+// `.select(0x18)` with `m_copro_ram_adr[offset >> 3]` — and its increment is
+// unconditional, stepping by FOUR when bit 18 of the register is set and by one
+// otherwise. The V60's single register increments only when its bit 15 is set,
+// and always by one. Two different rules on the same RAM; keeping each side's
+// registers on its own side is what makes that tractable.
+//
+// WHAT IS NOT HERE YET
+//
+// The four math units and the data-ROM window are brought out as external ports
+// rather than implemented inside. Both are table lookups into memory far too
+// large for M10K — 256 KB of tables and 2 MB of data — so they belong in SDRAM,
+// and the integrator owns that. The ports exist so the core can be exercised
+// against a testbench that serves them from the extracted ROMs.
+
+`timescale 1ns/1ps
+
+module m2_tgp #(
+  // See the io_rdata mux: forces unimplemented math-unit reads to 0 rather than
+  // table-base data. An experiment switch, not a feature.
+  parameter bit MATH_ZERO = 1'b0,
+  // AS_PROGRAM is 0x000-0x7ff. The microcode is exactly this size, so a smaller
+  // parameter would silently alias rather than fail.
+  // R852: 4096 for Model 2A -- Virtua Fighter 2 uploads 3,802 words (MAME's
+  // program map is 0x000-0xfff) and runs above 0x7ff 53% of the time.
+  parameter int unsigned PROG_WORDS = 2048,
+  // R852: subnormal products in the TGP's multiplier (Model 2A)
+  parameter bit SUBNORM = 1'b0,
+  // R888: the ALU op starts under its transfer (mb86233_core)
+  parameter bit EARLY_ALU = 1'b0,
+  // R888: POSTED BUFFER-RAM WRITES. 0: a write holds the TGP until both
+  // halves have landed (as before). N (a power of two): it is queued, N + 1
+  // deep, and acknowledged; the queue drains through bufw_* behind the TGP's
+  // back. See wq_busy below for what waits on the queue.
+  parameter int unsigned BUFW_Q = 0,
+  // R931: A FULL RESULT FIFO HOLDS THE TGP (1) INSTEAD OF DROPPING ITS PUSH
+  // (0, the original board's core since R146). MAME halts the TGP on a full
+  // output FIFO (model2.cpp: m_copro_fifo_out's full callback) and Model 1's
+  // m1_tgp holds its push; nothing is ever lost. Virtua Fighter 2's commands
+  // return up to 190 words, read as they come: an i960 held for long enough
+  // (an interrupt, a slow bus, R888's hold of a result read behind the TGP's
+  // posted stores) let the TGP run 129 ahead, the words past 128 were dropped,
+  // and the i960 waited for ever at its result read (#17; R871's 0x7dc4).
+  parameter bit OUT_STALL = 1'b0,
+  // AN EMPTY COMMAND FIFO STALLS THE PROCESSOR. OFF IS THE REFERENCE.
+  //
+  // gen_fifo.cpp's pop() returns T() on an empty FIFO -- but only AFTER firing
+  // the on-empty callback, which for the Model 2 TGP is `m_copro_tgp->stall()`
+  // (model2.cpp:193-196). mb86233.cpp:1225-1227 then replays the instruction:
+  // `do_stall: m_pc = m_ppc`. The zero is returned to a cancelled read. MAME's
+  // TGP sits at 004c until a word arrives and never enters the idle handler
+  // on an empty FIFO.
+  //
+  // With this parameter set the core instead free-runs the idle loop, which
+  // reads the FIFO three times an iteration (004c, 00b5, 00b6). Only 004c is
+  // the dispatch, so a command that lands during the other two is eaten as an
+  // operand: measured on Model 2 as 109 commands popped and none dispatched
+  // (R148/R149). The Model 1 deadlock note that used to live here (fout fills,
+  // TGP halts, fin fills, V60 halts -- 520cf6a) describes a consumer that
+  // stopped draining results; it is not a reason to take the idle path on an
+  // empty FIFO, and Model 1 has since concluded it was "probably not the
+  // crash".
+  //
+  // Kept as a switch because a stalling TGP is invisible in a harness that
+  // never pushes a command: `dbg_retires` stops moving. That is the correct
+  // behaviour, not a hang. Set it only to make an unfed core visibly execute.
+  parameter bit EMPTY_FIFO_READS_ZERO = 1'b0
+) (
+  input  logic        clk,
+  input  logic        rst_n,
+  // Read-back of the program RAM: see the sweep below.
+  output logic [23:0] dbg_ucode_ram_csum,
+  output logic        dbg_ucode_ram_ok,
+
+  // ---------------------------------------------------------- microcode ROM
+  // Written before the core is released from reset. On hardware this arrives
+  // over the MRA path like every other ROM; hard rule 2 keeps it out of the
+  // repository either way.
+  //
+  // ON ITS OWN CLOCK. The ROM loader lives in the fast memory domain and the
+  // coprocessor in the CPU domain, so this is a dual-clock memory: one write
+  // port, one read port, different clocks. That is the one memory shape Quartus
+  // infers without argument (measured in docs/mister-integration.md: 32768x8
+  // dual clock gives 32 M10K and 37 ALM), and it needs no handshake because the
+  // write side is finished before the core leaves reset.
+  input  logic        ucode_clk,
+  input  logic        ucode_we,
+  input  logic [11:0] ucode_addr,   // R852: [10:0] used when PROG_WORDS is 2048
+  input  logic [31:0] ucode_data,
+
+  // ------------------------------------------------------- copro RAM port
+  // Straight through to m1_copro_if, which arbitrates against the V60.
+  output logic        ram_req,
+  output logic        ram_we,
+  output logic [12:0] ram_addr,
+  output logic [31:0] ram_wdata,
+  input  logic [31:0] ram_rdata,
+  input  logic        ram_ack,
+
+  // ------------------------------------------------------------ the FIFOs
+  input  logic [31:0] fifo_in_data,    // V60 -> TGP, at data 0x0100
+  input  logic        fifo_in_valid,
+  output logic        fifo_in_pop,
+
+  output logic [31:0] fifo_out_data,   // TGP -> V60, at data 0x0400
+  output logic        fifo_out_push,
+  input  logic        fifo_out_full,
+
+  // ------------------------------------- math tables and the data-ROM window
+  // Both live in SDRAM. `tbl_addr` indexes 32-bit words of copro_tables, whose
+  // four 16K-word quadrants are sincos/atan/inv/isqrt; `dat_addr` indexes the
+  // 2 MB copro_data as 32-bit words.
+  output logic        tbl_req,
+  output logic [15:0] tbl_addr,
+  input  logic [31:0] tbl_rdata,
+  input  logic        tbl_ack,
+
+  output logic        dat_req,
+  output logic [19:0] dat_addr,
+  output logic        dat_we,        // the window WRITES bufferram too
+  output logic [15:0] dat_wdata,
+  output logic        dat_is_buf,    // 1 = bufferram, 0 = copro data ROM
+  output logic        dat_half,      // which 16-bit half of the dword
+  // BUFFER-RAM WRITES GO OUT ON THEIR OWN PORT, not the read port. Making
+  // port 9 read-write cost the 96 MHz domain four seeds (-0.253 .. -0.381,
+  // worsening) because p_we/p_din/p_be widen the logic feeding m2_sdram's
+  // `cmd`. These go to the SHARED WRITE PORT instead -- the one the loader,
+  // the self-test and m2_geo take turns on -- which is idle during gameplay
+  // and outside the arbiter entirely. Measured need: 250 writes per 600
+  // frames, against 7,537 reads. Study R133.
+  output logic        bufw_req,
+  output logic [18:0] bufw_addr,     // word address within bufferram
+  output logic [15:0] bufw_data,
+  input  logic        bufw_ack,
+  input  logic [31:0] dat_rdata,
+  input  logic        dat_ack,
+
+  // Telemetry: is it executing, and is it retiring anything.
+  output logic [15:0] dbg_retires,
+  output logic [15:0] dbg_pc,
+  // THE WORD AT THAT PC. "Wrong program" and "wrong decode" need completely
+  // different fixes and look identical from a PC trace alone.
+  output logic [31:0] dbg_op,
+  output logic [31:0] dbg_fifo_hold,
+  output logic [31:0] dbg_wr_n,
+  output logic [16:0] dbg_wr_addr,
+  output logic [31:0] dbg_wr_data,
+  output logic [31:0] dbg_st,
+  output logic [31:0] dbg_a,
+  output logic [31:0] dbg_b,
+  output logic [31:0] dbg_d,
+  output logic        dbg_unimplemented,
+
+  // What it is waiting on, if it has stopped. A retire count that freezes says
+  // only "stopped"; these say WHERE. io_rd or io_wr held with no ack is an
+  // unanswered IO access, and the address names which one — a decode gap looks
+  // identical to a dead coprocessor without this.
+  output logic [15:0] dbg_io_addr,
+  output logic        dbg_io_rd,
+  output logic        dbg_io_wr,
+  output logic        dbg_io_ack,
+  output logic [15:0] dbg_ff_math, dbg_ff_rom, dbg_ff_buf, dbg_rd_total,
+  output logic        dbg_fifo_rd,
+  output logic        dbg_fifo_wr,
+  // The bank register itself (R133). If the microcode never writes rf 3 the
+  // window is disabled and sel_rom/sel_buf never assert -- which would make
+  // the whole banked path dead rather than wrong.
+  output logic [31:0] dbg_bank,
+  // R888: a posted buffer-RAM write has not landed yet (BUFW_Q != 0). The
+  // i960's read of an output word waits on it (m2_copro).
+  output logic        wq_busy,
+  // R923: EVERY HANDSHAKE THE TGP CAN WAIT ON, in one word, for the board
+  // probe (M2_PROBE_TGP). A TGP that never answers is parked on exactly one
+  // of these; the state and the req / ack pairs say which. Plain wires: a
+  // design that leaves the port open loses them in synthesis.
+  //   31 core out of reset   30:27 mb86233_core state   26 io_rd 25 io_wr
+  //   24 io_ack  23 tbl_req 22 tbl_ack 21 dat_req 20 dat_ack
+  //   19 bufw_req 18 bufw_ack 17 wq_busy 16 a posted write acknowledged
+  //   15 fifo_rd 14 fifo_wr 13 fifo_ack 12 popped 11 pushed
+  //   10 input FIFO has a word  9 output FIFO full  8 sel_buf 7 sel_rom
+  //   6 sel_math 5 buf_rd_ok 4 wr_hi 3:1 0  0 unimplemented op
+  output logic [31:0] dbg_hs,
+  // R923: TGP output words dropped because the output FIFO was full (the
+  // push is acknowledged and lost -- see fifo_ack). Cycles, saturating; it
+  // must read 0. u_fout's own `dropped` cannot see these (the push is gated).
+  output logic [15:0] dbg_out_refused
+);
+
+  // ------------------------------------------------------------ microcode ROM
+  // 2048 x 32 is 8 M10K. One write port for the loader, one read for the core.
+  localparam int unsigned PAW = $clog2(PROG_WORDS);
+  (* ramstyle = "M10K" *) logic [31:0] prog [PROG_WORDS];
+
+  logic [15:0] prog_addr;
+  logic [31:0] prog_rdata;
+
+  always_ff @(posedge ucode_clk) begin
+    if (ucode_we) prog[ucode_addr[PAW-1:0]] <= ucode_data;
+  end
+  // ------------------------------------------- program-RAM read-back checksum
+  //
+  // WHAT ROW 02 DOES NOT PROVE. The loader's ucode_csum is folded at the IOCTL
+  // INPUT, before the write, so `800B9A` says the HPS delivered 2048 correct
+  // words and nothing about what reached this array. That is exactly the gap
+  // rows 07/0B had for SDRAM, which was only closed by reading the memory back -
+  // and the board is sitting at pc 0x7E6 with 53 retires, which is where a
+  // coprocessor executing an EMPTY program RAM ends up.
+  //
+  // Swept while the core is still in reset, through the existing read port, so
+  // no third port is needed. 2048 cycles, and the core is released when it
+  // finishes - invisible next to a ROM download.
+  // THE RELEASE DELAY IS DELIBERATE, NOT A SIDE EFFECT OF THE SWEEP.
+  //
+  // Measured on hardware 2026-08-23: without it the coprocessor parked at
+  // microcode 0x7E6 with 53 retires and made no SDRAM reads at all - the
+  // empty-program-RAM signature - and the V60 then filled the command FIFO and
+  // halted behind it. Adding the sweep, whose only other effect is to hold the
+  // core in reset for 2048 cycles, made it run. So there is a race at release,
+  // and the delay is what wins it.
+  //
+  // The sweep proves the RAM is intact (row 0C reads A07D51, matching the ROM
+  // image exactly), so the race is not the microcode still arriving - it is
+  // something at the moment of release that this has not identified yet. Until
+  // it is identified the delay stays, EXPLICITLY, so that removing the debug
+  // instrument cannot silently bring the hang back.
+  localparam int RELEASE_DELAY = 2048;
+
+  logic [12:0] sw_addr;   // R852: one bit more, so 4096 words can end
+  logic        sw_busy, sw_done;
+  logic [23:0] sw_csum;
+  logic [11:0] rel_cnt;
+  logic        rel_done;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      rel_cnt <= 12'd0; rel_done <= 1'b0;
+    end else if (!rel_done) begin
+      rel_cnt <= rel_cnt + 12'd1;
+      if (rel_cnt == 12'(RELEASE_DELAY - 1)) rel_done <= 1'b1;
+    end
+  end
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      sw_addr <= 13'd0; sw_busy <= 1'b1; sw_done <= 1'b0; sw_csum <= 24'd0;
+    end else if (sw_busy) begin
+      sw_addr <= sw_addr + 13'd1;
+      // One cycle of read latency: fold the word for the PREVIOUS address.
+      if (sw_addr != 13'd0)
+        sw_csum <= {sw_csum[22:0], sw_csum[23]} ^ prog_rdata[23:0];
+      if (sw_addr == 13'(PROG_WORDS)) begin
+        sw_busy <= 1'b0;
+        sw_done <= 1'b1;
+      end
+    end
+  end
+
+  assign dbg_st = u_st;
+  assign dbg_a = u_a;
+  assign dbg_b = u_b;
+  assign dbg_d = u_d;
+  assign dbg_op = prog_rdata;
+  assign dbg_ucode_ram_csum = sw_csum;
+  assign dbg_ucode_ram_ok   = sw_done;
+
+  always_ff @(posedge clk) begin
+    prog_rdata <= prog[sw_busy ? sw_addr[PAW-1:0] : prog_addr[PAW-1:0]];
+  end
+
+  // ----------------------------------------------------------- the core
+  logic [15:0] io_addr;
+  logic        io_rd, io_wr;
+  logic [31:0] io_wdata, io_rdata;
+  logic        io_ack;
+  logic        fifo_rd, fifo_wr;
+  logic [31:0] fifo_wdata, fifo_rdata;
+  logic        fifo_ack;
+  logic        retire;
+  logic [15:0] retire_pc;
+
+  // Architectural state the lockstep harness uses; unread here.
+  logic [31:0] u_a, u_b, u_d, u_p, u_st, u_mwdata, u_mrdata;
+  logic [15:0] u_m;
+  logic [16:0] u_maddr;
+  logic        u_mwe, u_mre;
+  logic [7:0]  u_c0, u_c1, u_rep;
+
+  logic [3:0] core_state;    // R923: the probe's view of the sequencer
+  mb86233_core #(.SUBNORM(SUBNORM), .EARLY_ALU(EARLY_ALU), .OUT_HOLD(OUT_STALL)) core (   // R931
+    .clk(clk), .rst_n(rst_n && sw_done && rel_done),
+    .prog_addr(prog_addr), .prog_rdata(prog_rdata),
+    .io_addr(io_addr), .io_rd(io_rd), .io_wr(io_wr),
+    .io_wdata(io_wdata), .io_rdata(io_rdata), .io_ack(io_ack),
+    .dbg_fifo_hold(dbg_fifo_hold), .dbg_wr_n(dbg_wr_n), .dbg_wr_addr(dbg_wr_addr), .dbg_wr_data(dbg_wr_data),
+    .fifo_rd(fifo_rd), .fifo_wr(fifo_wr), .fifo_wdata(fifo_wdata),
+    .fifo_rdata(fifo_rdata), .fifo_ack(fifo_ack),
+    .gpio({3'b000, at_s2}),          // gpio0 = the atan unit's |a| <= |b| (R212)
+    .retire(retire), .retire_pc(retire_pc), .unimplemented(dbg_unimplemented),
+    // The lockstep bridge's view: unused in the design, driven from sim/tgp for
+    // M0 exit criterion 2. Named rather than left empty so the connection is
+    // explicit — an empty-by-name pin and a genuinely forgotten one look
+    // identical in a diff.
+    .dbg_a(u_a), .dbg_b(u_b), .dbg_d(u_d), .dbg_p(u_p), .dbg_st(u_st),
+    .dbg_m(u_m), .dbg_mem_addr(u_maddr), .dbg_mem_wdata(u_mwdata),
+    .dbg_mem_we(u_mwe), .dbg_mem_re(u_mre), .dbg_mem_rdata(u_mrdata),
+    .dbg_c0(u_c0), .dbg_c1(u_c1), .dbg_rep(u_rep),
+    .bank_reg(bank_reg),
+    .dbg_state(core_state)   // R923
+  );
+
+  // ------------------------------------------------------- data-space FIFOs
+  // mb86233_mem forwards exactly two data addresses out here: 0x0100 reads the
+  // inbound FIFO and 0x0400 writes the outbound one. Both are held until ack.
+  //
+  // ONE POP PER ACCESS, NOT ONE PER CYCLE.
+  //
+  // `fifo_in_pop = fifo_rd && fifo_in_valid` popped on EVERY cycle the request
+  // was held, and mb86233_core asserts mem_req in BOTH S_SRC and S_SRC_W — it has
+  // to, because a RAM read is registered and the address must stay put. A RAM read
+  // does not care: reading twice returns the same word. A FIFO read does. Every
+  // `mov (x1), b` therefore consumed TWO command words.
+  //
+  // Measured: the microcode at 0x00a5/0x00a6 is two consecutive FIFO reads, and
+  // both of the last two words were popped at pc 0x00a5 — the reference pops one at
+  // 0x00a5 and one at 0x00a6, then multiplies at 0x00a7 and writes its result. Ours
+  // ate the command and waited forever for a word the V60 had already sent.
+  //
+  // `popped` clears when the request drops, so it is one pop per access however
+  // long the access is held, and it fires on the first cycle the data is actually
+  // there — an access that arrives at an empty FIFO still pops when the V60 fills
+  // it. The word is latched because the head moves on as soon as it is taken.
+  logic        popped;
+  logic [31:0] pop_data;
+  logic        pushed;
+
+  assign fifo_in_pop   = fifo_rd && fifo_in_valid && !popped;
+  // AND THE SAME ON THE WRITE SIDE. mem_req is asserted in both S_DST and S_DST_W
+  // for the same reason, so every `mov p, (bx1)` pushed its result into the
+  // outbound FIFO TWICE — visible the moment the first correct result appeared,
+  // as `COPRO RESULT: 42520000` printed twice for one multiply. The V60 would then
+  // read a duplicate for its next result and go wrong a command later.
+  assign fifo_out_push = fifo_wr && !fifo_out_full && !pushed;
+  assign fifo_out_data = fifo_wdata;
+  // AN EMPTY POP READS ZERO, NOT THE STALE HEAD. gen_fifo's pop() returns T()
+  // -- zero -- and EMPTY_FIFO_READS_ZERO only ever meant "do not stall". It was
+  // wired into the DATA mux as well, so with the parameter set an empty read
+  // completed and handed back whatever fifo_in_data still held. The latched
+  // path below already gets this right (`fifo_in_valid ? fifo_in_data : 0`);
+  // the combinational one did not, and the acknowledge is combinational, so
+  // the core could take the stale word in the same cycle.
+  assign fifo_rdata    = popped ? pop_data
+                       : fifo_in_valid ? fifo_in_data : 32'd0;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      sincos_base <= 32'd0; inv_base <= 32'd0; isqrt_base <= 32'd0;
+      atan_base[0] <= 32'd0; atan_base[1] <= 32'd0;
+      atan_base[2] <= 32'd0; atan_base[3] <= 32'd0;
+    end else if (io_wr && sel_math) begin
+      unique case (math_unit)
+        2'd0: sincos_base            <= io_wdata;
+        2'd1: atan_base[io_addr[1:0]] <= io_wdata;
+        2'd2: inv_base               <= io_wdata;
+        2'd3: isqrt_base             <= io_wdata;
+      endcase
+    end
+    if (!rst_n) begin
+      popped   <= 1'b0;
+      pop_data <= 32'd0;
+    end else if (!fifo_rd) begin
+      popped   <= 1'b0;
+    end else if (fifo_rd && !popped && (EMPTY_FIFO_READS_ZERO || fifo_in_valid)) begin
+      // Latched on the first cycle of the access whether or not the FIFO had
+      // anything, so one access yields one value. Without this an access held
+      // across S_SRC and S_SRC_W could read 0 on one cycle and a word the V60
+      // pushed in between on the next.
+      popped   <= 1'b1;
+      pop_data <= fifo_in_valid ? fifo_in_data : 32'd0;
+    end
+  end
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n)               pushed <= 1'b0;
+    else if (!fifo_wr)        pushed <= 1'b0;
+    else if (fifo_out_push)   pushed <= 1'b1;
+  end
+
+  // A READ OF AN EMPTY INBOUND FIFO RETURNS ZERO AND COMPLETES. It must not
+  // block, and the comment that used to stand here - "MAME's generic_fifo blocks
+  // the same way" - was wrong about the one thing it was cited for.
+  // gen_fifo.h, on_fifo_empty_pre_sync: "Called on a pop with an empty fifo.
+  // Must ask the destination to try again. THE POP ITSELF WILL THEN RETURN ZERO."
+  //
+  // THE MICROCODE DEPENDS ON THAT ZERO. 004D-0052 is a dispatch:
+  //
+  //     004D  mov (x1), b        x1 = 0x100, so this POPS a command
+  //     ...
+  //     0052  brul alw d         d = get_exp(b) + 0x53 - a COMPUTED JUMP
+  //
+  // get_exp is `(val >> 23) & 0xff`, so an empty FIFO gives b = 0, d = 0x53, and
+  // 0x53 is the IDLE handler, which loops back to 0x9b and polls again. The
+  // command type is carried in the exponent field and selects a handler above it.
+  //
+  // Blocking here means the microcode can NEVER see b = 0 and can never reach its
+  // idle path, so it parks at 004C forever the first time it polls an empty FIFO.
+  // That is precisely the recorded symptom - pc=004c, 342 retires, and about
+  // fourteen io accesses per run where the reference makes 158,391 in 400 frames.
+  // tgp_trace agreed for 75,175 instructions and then split exactly here: the
+  // reference took 0052 -> 0053 -> 009b and kept polling, we took 0052 -> 0064.
+  //
+  // Measured, same 16s window: 61 pushes against a pop capture that filled its
+  // 300-entry cap. Nearly every pop the reference makes is an empty one.
+  //
+  // The OUTBOUND fifo keeps its stall. That direction is the V60 reading results,
+  // where acknowledging an empty read returned a stale word and hung the CPU at
+  // fed5a4; MAME halts the maincpu there rather than letting it proceed.
+  // A PUSH INTO A FULL OUTPUT FIFO MUST NOT STALL THE COPROCESSOR. gen_fifo.h
+  // is explicit that its queue never blocks a push -- "there may be extra
+  // values stored ... may be bigger than the fifo size" -- so the reference
+  // TGP carries straight on and MAME cannot reach the state this created.
+  //
+  // MEASURED, and it is why the board sat at frame 1: the i960 parks on the
+  // mailbox poll at 0x1166C (R142), stops draining results, `fout` fills, and
+  // the coprocessor freezes here -- 10,815 retires in 40 SECONDS, about 270
+  // instructions per second against MAME's 4.6 million. Frozen, it never
+  // reaches the dispatch that would clear the mailbox and release the i960.
+  // Both ends then wait for each other, which is the deadlock Model 1 records
+  // in 520cf6a: "fout fills, the TGP halts, fin fills, the V60 halts".
+  //
+  // Dropping rather than growing: an M10K queue cannot grow, and `dropped` is
+  // already counted. The words lost here are the idle handler's zeros from
+  // 00b8, which no consumer wants. The INBOUND direction keeps its interlock.
+  //
+  // R931: THE 2A CORE HOLDS INSTEAD (OUT_STALL), as MAME and Model 1 do --
+  // m1_tgp's `fifo_wr ? (!fifo_out_full || pushed)`. Every 2A game reads its
+  // results within nine words of the TGP in MAME (VF2, Sega Rally, Virtua Cop
+  // 2, Zero Gunner captures), so no 2A program leaves a word unread for the
+  // hold to wait on; VF2 has commands of 83-190 results, longer than the
+  // 128-word FIFO, which a dropped push turned into a lost result.
+  assign fifo_ack = fifo_rd ? (EMPTY_FIFO_READS_ZERO || fifo_in_valid || popped)
+                  : fifo_wr ? (!OUT_STALL || !fifo_out_full || pushed)
+                  : 1'b0;
+
+  // ------------------------------------------------------------- IO space
+  //   0x0000-0x001f   copro RAM: addr at [2:0]==0, data at [2:0]==1,
+  //                   register index in [4:3]
+  //   0x0020-0x0023   sincos     0x0024-0x0027  atan
+  //   0x0028-0x0029   inv        0x002a-0x002b  isqrt
+  //   0x002e          copro_data window base
+  //   0x8000-0xffff   copro_data read, low 15 bits from the address
+  logic [31:0] copro_adr [4];         // the TGP's four registers
+
+  // Power-on zero, same reasoning as mb86233_regs' rf and m1_copro_if's ram: four
+  // flops on the device, ones in Verilator, and the TGP reads one of these to
+  // address coprocessor RAM before necessarily writing it.
+  integer za;
+  initial for (za = 0; za < 4; za = za + 1) copro_adr[za] = 32'd0;
+
+  // ------------------------------------------------ THE BANKED WINDOW (R133)
+  //
+  // Everything in copro_tgp_io_map that is not a math unit sits behind a VIEW,
+  // and the view's base -- and its very existence -- come from AS_RF register 3:
+  //
+  //     copro_tgp_bank_w(d): bank_reg = d;
+  //                          if (d & 0xc00000) view.select(0); else view.disable();
+  //
+  //     adr = (bank_reg & 0xff0000) | offset;
+  //     if (adr & 0x800000) -> copro data ROM
+  //     if (adr & 0x400000) -> bufferram          (READ AND WRITTEN)
+  //     else                -> 0
+  //
+  // This core previously invented all of that: the base came from writes to io
+  // 0x2e, the target was chosen by OFFSET bit 15, the view was always on, and
+  // the coprocessor could not write bufferram at all. rf 3 was stored and never
+  // read. None of it showed up in the opcode fuzz or the i960 PC differential,
+  // because a processor can execute the right program and still read the wrong
+  // memory -- it produces wrong VALUES, not divergence.
+  wire [31:0] bank_reg;
+  assign dbg_bank = bank_reg;
+  wire [23:0] win_adr  = {bank_reg[23:16], io_addr};
+  wire        win_en   = |bank_reg[23:22];          // else the view is not there
+  wire        sel_rom  = win_en && win_adr[23];     // copro data ROM
+  wire        sel_buf  = win_en && !win_adr[23] && win_adr[22];   // bufferram
+
+  // THE VIEW OVERRIDES EVERYTHING WHILE IT IS SELECTED, AND THIS DECODE HAD IT
+  // THE OTHER WAY ROUND (R156).
+  //
+  // model2.cpp installs the math units and THEN the view, over the whole space:
+  //
+  //     map(0x00020, 0x00023) sincos ... map(0x0002a, 0x0002b) isqrt
+  //     map(0x0000, 0xffff).view(m_copro_tgp_bank);
+  //     m_copro_tgp_bank[0](0x0000, 0xffff).rw(copro_tgp_memory_r, ...);
+  //
+  // A selected view covers its whole range and hides what is underneath, so
+  // when the bank is on, io 0x0000-0xffff IS the banked memory -- including
+  // 0x00-0x1f and the math units at 0x20-0x2b. The microcode knows this and
+  // turns the bank off before it needs them: `ldi #0x0, rf3` at 0x7C9 and
+  // 0x7D6, either side of the two windowed reads at 0x7CF and 0x7D3.
+  //
+  // These selects used to be computed from the address ALONE and were tested
+  // FIRST in the io_rdata mux, so they beat the window. Daytona's TGP init
+  // reads the data ROM at offset 0x10 (`mov (bx1) (e), d` at 0x7CF, with b1 =
+  // 0x10): that hit `sel_radr`, returned copro_adr[2] -- a register nothing had
+  // written, so zero -- and threw away the 0x30 the ROM had actually returned.
+  // `dat_req` fired all the same, which is why the read was visible on the bus
+  // and correct there while the core got zero.
+  //
+  // The cost: $0x69, the base every display-list access is built from, came out
+  // 0x30 low, the loop count was fetched from the wrong dword and read
+  // 0xFFFFFFFF, and the coprocessor never reached its mailbox clear at 0x4C4.
+  //
+  // sel_radr/sel_rdat are a MODEL 1 inheritance in any case -- model1_m.cpp's
+  // copro RAM window. Model 2's io map has nothing at 0x00-0x1f but the view.
+  // They are left reachable with the bank off rather than deleted, because
+  // removing them is a separate change with no consumer asking for it.
+  // R156 IS REVERTED HERE ON HARDWARE EVIDENCE (R161). Gating these on the
+  // window cost the tilemap on the board: the TGP hung, the i960 stalled on
+  // its next FIFO read, and the CPU never drew. The 0x10 read R156 was aimed
+  // at is real and still owed -- but sel_math was gated with it, on an
+  // argument from MAME's view semantics rather than a measurement, and the
+  // pair has never been separated. Fix it narrowly, with a board result.
+  // NARROW R156 (R163): the window beats the MODEL 1 REGISTER FILE only.
+  //
+  // The measured fault is `sel_radr` stealing the coprocessor's data-ROM read
+  // at io 0x10 -- the init at 0x7CF that builds $0x69, the base every
+  // display-list access is computed from. That read is real, traced, and worth
+  // 0x30 on every address the coprocessor forms afterwards.
+  //
+  // The FULL R156 gated `io_mid` with it, so the math units went behind the
+  // window too. That half was an argument from MAME's view semantics, not a
+  // measurement, and on the board it cost the tilemap -- the TGP hung, the i960
+  // stalled on its next FIFO read, and the CPU never drew. The two were never
+  // separated. They are separated now: sel_radr/sel_rdat are Model 1
+  // inheritance that Model 2's io map does not have at all, so losing them to
+  // the window costs nothing; the math units keep their addresses.
+  wire        io_lo    = !win_en && (io_addr[15:5] == 11'd0);
+  wire        sel_radr = io_lo && (io_addr[2:0] == 3'd0);
+  wire        sel_rdat = io_lo && (io_addr[2:0] == 3'd1);
+  wire [1:0]  radr_i   = io_addr[4:3];
+
+  wire        io_mid   = (io_addr[15:5] == 11'd1);   // 0x20-0x3f
+  // GATED BY THE WINDOW, AS THE FULL R156 HAD IT AND AS MAME'S VIEW SEMANTICS
+  // SAY. The narrow R156 left the math units reachable with the bank on, and
+  // the read mux ranks them above the banked memory, so a windowed load from
+  // io 0x20 was answered by the sincos unit. The microcode's init (sub_7cb,
+  // 0x7d3) reads copro data ROM dword 0x20 exactly that way to form $0x6a,
+  // the base of the track-lookup records: it got 0 instead of 0x19C90, every
+  // record fetch landed on zeros, every placement query returned the "not
+  // found" default, and the cars were placed off the scene (study R205).
+  // Measured in the boot bench: d = 0 after 0x7d3 while the bus returned
+  // 0x19C90. The tilemap cost the full R156 was blamed for was the masked
+  // dummy write (R202) and the shared write port, not this gate.
+  wire        sel_math = !win_en && io_mid && (io_addr[4:0] <= 5'h0b);
+
+  // ---------------------------------------------------- the math units
+  //
+  // sincos, atan, inv and isqrt, read off model1_m.cpp's copro_sincos_r,
+  // copro_atan_r, copro_inv_r and copro_isqrt_r. Each is a table lookup in one
+  // 16K-word quadrant plus a fixup; the quadrant is the top two bits of the
+  // table index, which is why {unit, index} is the whole address.
+  //
+  // These used to return the quadrant BASE word, unindexed and unfixed, and
+  // this file's own comment predicted exactly what that caused: "the TGP
+  // computes with a wrong operand and writes a wrong result into coprocessor
+  // RAM - and the V60 then waits at FED5A4 for that word's low byte to read
+  // zero, forever." It does, 6,221,912 times in a fifteen-second run.
+  //
+  // Each unit latches an operand on a WRITE and computes on a READ. The bases
+  // are separate registers, not one shared register: the units are independent
+  // hardware and the microcode interleaves them.
+  wire [1:0] math_unit = (io_addr[4:0] <= 5'h03) ? 2'd0    // sincos 0x20-0x23
+                       : (io_addr[4:0] <= 5'h07) ? 2'd1    // atan   0x24-0x27
+                       : (io_addr[4:0] <= 5'h09) ? 2'd2    // inv    0x28-0x29
+                       :                           2'd3;   // isqrt  0x2a-0x2b
+
+  logic [31:0] sincos_base, inv_base, isqrt_base;
+  logic [31:0] atan_base [4];
+  // No `initial` block here on purpose. There was one, zeroing all four of
+  // these, and every one of them is ALREADY cleared in the reset branch of the
+  // always_ff above -- so it was pure redundancy that made Verilator report
+  // them as MULTIDRIVEN (written from both an initial and an always_ff), which
+  // is an error under -Wall and stopped the boot harness building the moment
+  // the coprocessor was added to it. The unit-test flow never saw it because
+  // its own warning filter is wider.
+
+  // sincos: ang = base + offset*0x4000, index = ang & 0x3fff, and the second
+  // quadrant mirrors - std::min(0x4000 - index, 0x3fff), so index 0 maps to
+  // 0x3fff rather than to 0x4000, which is off the end of the quadrant.
+  wire [15:0] sc_ang   = sincos_base[15:0] + {io_addr[1:0], 14'd0};
+  wire [13:0] sc_raw   = sc_ang[13:0];
+  wire [14:0] sc_mirr  = 15'h4000 - {1'b0, sc_raw};
+  wire [13:0] sc_index = !sc_ang[14] ? sc_raw
+                       : (sc_mirr > 15'h3fff) ? 14'h3fff : sc_mirr[13:0];
+
+  // inv / isqrt: the index comes from the operand's mantissa, the exponent is
+  // rebiased against the operand's, and the sign is patched in afterwards.
+  wire [13:0] inv_index   = {inv_base[22:10], 1'b0} | {13'd0, io_addr[0]};
+  wire [13:0] isqrt_index = 14'h2000 ^ ({isqrt_base[23:11], 1'b0}
+                                        | {13'd0, io_addr[0]});
+
+  // ATAN, PER MODEL 2 (model2.cpp copro_atan_r), NOT MODEL 1 (R212). Base 3
+  // is a FLOAT, the ratio of the smaller operand to the larger, and the
+  // table index is its mantissa shifted by ie = 0x88 - exponent field:
+  //   ie = 0x88 - (base3 >> 23);  index = ie <= 0x17 ? (mant | 0x800000) >> ie : 0
+  //   index == 0x4000 -> 0x3fff
+  // Model 1 indexed the table with an INTEGER in base 3, and that is what
+  // stood here: the game's horizon angle came back as 0 or exactly -45
+  // degrees and the background jumped with it.
+  // `ie` IS AN 8-BIT SUBTRACTION (u8 in the reference): for a NEGATIVE ratio
+  // base3 >> 23 carries the sign bit, 0x88 - 0x1xx wraps, and the result is
+  // the same shift as for the positive ratio. Done in 9 bits it went past
+  // 0x17 and the index collapsed to 0 -- every job with a negative operand
+  // came back as exactly 0 or exactly 0x4000 in the bench's ATAN check.
+  wire [7:0]  at_ie  = 8'h88 - atan_base[3][30:23];
+  wire [23:0] at_m   = {1'b1, atan_base[3][22:0]};
+  wire [23:0] at_sh  = (at_ie <= 8'h17) ? (at_m >> at_ie[4:0]) : 24'd0;
+  wire [13:0] at_index = (at_sh >= 24'h4000) ? 14'h3fff : at_sh[13:0];
+
+  wire [13:0] math_index = (math_unit == 2'd0) ? sc_index
+                         : (math_unit == 2'd1) ? at_index
+                         : (math_unit == 2'd2) ? inv_index
+                         :                       isqrt_index;
+
+  assign tbl_req  = (io_rd && sel_math);
+  assign tbl_addr = {math_unit, math_index};
+
+  // ---- the fixups, applied to the word the table returned
+
+  // INV, PER MODEL 2: the sign is the OPERAND's, and only on the odd word --
+  //   result = (table & 0x007fffff) | (exp << 23); if (base < 0 && offset) result |= sign
+  // Model 1 kept the table's sign and flipped it for a negative operand on
+  // both words; that is what stood here (R212).
+  wire [7:0] inv_exp = tbl_rdata[30:23] + (8'h7f - inv_base[30:23]);
+  wire [31:0] inv_val = {inv_base[31] & io_addr[0], inv_exp, tbl_rdata[22:0]};
+
+  wire [7:0] isq_exp = tbl_rdata[30:23] + (8'h3f - {1'b0, isqrt_base[30:24]});
+  wire [31:0] isq_raw = {tbl_rdata[31], isq_exp, tbl_rdata[22:0]};
+  wire [31:0] isqrt_val = io_addr[0] ? isq_raw : {1'b0, isq_raw[30:0]};
+
+  wire [31:0] sincos_val = sc_ang[15] ? {~tbl_rdata[31], tbl_rdata[30:0]}
+                                      : tbl_rdata;
+
+  // The table-word fixup that stood here was Model 1's (model1_m.cpp corrects
+  // a ROM table on the way out); Model 2's handler reads its table as it is.
+  //
+  // s2 IS A COMPARISON, NOT A STORED SIGN: |base0| <= |base1|, which Model 2
+  // also presents to the microcode as the gpio0 CONDITION (copro_atan_w
+  // calls gpio0_w with it on every base write). sub_797 branches on gpio0 to
+  // pick the octant before it forms the ratio; with gpio0 tied low, as it
+  // was, the swap was never taken.
+  wire at_s0 = atan_base[0][31];
+  wire at_s1 = atan_base[1][31];
+  wire at_s2 = (atan_base[0][30:0] <= atan_base[1][30:0]);
+  wire [31:0] at_shifted = (at_s0 ^ at_s1 ^ at_s2) ? {16'd0, tbl_rdata[31:16]}
+                                                   : tbl_rdata;
+  wire [31:0] at_signed  = at_shifted
+                         + (at_s2 ? 32'h4000 : 32'd0)
+                         + (((at_s0 && !at_s2) || (at_s1 && at_s2)) ? 32'h8000
+                                                                    : 32'd0);
+  wire [31:0] atan_val = {16'd0, at_signed[15:0]};
+
+  wire [31:0] math_val = (math_unit == 2'd0) ? sincos_val
+                       : (math_unit == 2'd1) ? atan_val
+                       : (math_unit == 2'd2) ? inv_val
+                       :                       isqrt_val;
+  // ONE PORT, TWO REGIONS. The window reaches the copro data ROM or buffer
+  // RAM, and `dat_is_buf` tells the top level which base to add. Buffer RAM
+  // is WRITTEN as well as read -- copro_tgp_memory_w -- which is how the
+  // coprocessor and the i960 share results, and this core has never had it.
+  // A WRITE IS TWO TRANSACTIONS. The port carries 16 bits of write data and
+  // bufferram holds dwords, so the low half goes first and the access is not
+  // acknowledged until the high half lands. Reads need no such thing: the
+  // port is burst 4 and returns 64 bits at once.
+  // THE REQUEST MUST DROP BETWEEN THE HALVES. Holding it high across both is
+  // what hung the board: the shared write port takes a request, acknowledges it
+  // ONCE, and a level that never falls is one request, not two. Measured as
+  // io_addr=7ffc, io_wr=1, io_ack=0 with the bank correctly selecting bufferram.
+  // `bi_`, the buffer initialiser, already does it the right way -- assert,
+  // wait for the ack, drop, re-assert for the next word -- and this now matches.
+  logic wr_hi;        // which half is in flight
+  logic wr_pend;      // a request is outstanding on the port
+  logic wr_done;      // both halves have landed; hold the ack until io_wr falls
+  logic [31:0] bw_data;   // the word being written, and its address
+  logic [14:0] bw_addr;
+  logic        bw_ack;    // io_ack for a buffer-RAM write
+  logic        buf_rd_ok; // a buffer-RAM read may go out
+
+  generate if (BUFW_Q == 0) begin : g_bufw_direct
+  wire  wr_start = io_wr && sel_buf && !wr_done;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      wr_hi <= 1'b0; wr_pend <= 1'b0; wr_done <= 1'b0;
+    end else if (!(io_wr && sel_buf)) begin
+      wr_hi <= 1'b0; wr_pend <= 1'b0; wr_done <= 1'b0;   // access over, re-arm
+    end else if (bufw_ack && wr_pend) begin
+      wr_pend <= 1'b0;                                    // drop the request
+      if (wr_hi) wr_done <= 1'b1;                         // high half landed
+      else       wr_hi   <= 1'b1;                         // now do the high half
+    end else if (wr_start && !wr_pend) begin
+      wr_pend <= 1'b1;                                    // raise the next one
+    end
+  end
+  assign bw_data   = io_wdata;
+  assign bw_addr   = win_adr[14:0];
+  assign bw_ack    = wr_done;
+  assign buf_rd_ok = 1'b1;
+  assign wq_busy   = 1'b0;
+  end else begin : g_bufw_posted
+  // R888: SEGA RALLY SPENT 27% OF ITS TGP TIME HERE. Its program copies
+  // ~1,700 dwords a frame into buffer RAM (pc 0x15b, `mov (data) -> io` under
+  // a rep, ~12 words a call), and each waited for two shared-write-port
+  // transactions: ~60 clk_sys a word in the board-like replay, against one
+  // instruction in MAME. The word is queued instead and the instruction
+  // completes; the queue drains with exactly the handshake above (request,
+  // acknowledge, drop, re-raise -- the halves, and the entries, never closer
+  // than one idle cycle apart), in order, so the i960 and the walker see the
+  // TGP's stores in the order it made them.
+  //
+  // WHAT WAITS ON IT (wq_busy: a word in the queue, its head or in flight):
+  //   * the TGP's own buffer-RAM reads (port 9) that fall inside the span of
+  //     addresses queued since the queue was last empty -- a read must see
+  //     the stores before it, and it goes out on another port. Every queued
+  //     address is inside [wq_lo, wq_hi], so a read outside it cannot alias
+  //     one. Rally's reads mostly follow a 13-word copy and fall outside it
+  //     (4.3% inside the span of the last 33 stores); waiting for the whole
+  //     queue instead cost 163 M cycles in a slow-memory replay;
+  //   * the i960's read of a result word (m2_copro): the i960 learns that a
+  //     command is done from the output FIFO, so every store the TGP made
+  //     before that has landed when the read completes.
+  // Data-ROM reads do not wait: nothing writes the ROM. A reset of the TGP
+  // (halt, upload) drops a word not yet written -- the queue drains in well
+  // under a microsecond, and the i960 halts the TGP only around an upload.
+  logic        enq_done;
+  logic        wq_full, wq_v, wq_held;
+  logic        span_v;           // [wq_lo, wq_hi] holds every queued address
+  logic [14:0] wq_lo, wq_hi;
+  logic [46:0] wq_q;
+  wire         wq_push = io_wr && sel_buf && !enq_done && !wq_full;
+  wire         wq_pop  = wq_v && bufw_ack && wr_pend && wr_hi;
+  m2_fifo_m10k #(.DW(47), .DEPTH(BUFW_Q), .RAMSTYLE("MLAB")) u_wq (
+    .clk(clk), .rst_n(rst_n),
+    .push(wq_push), .din({win_adr[14:0], io_wdata}),
+    .pop(wq_pop), .q(wq_q), .q_valid(wq_v),
+    .full(wq_full), .count(), .held(wq_held), .dropped()
+  );
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      wr_hi <= 1'b0; wr_pend <= 1'b0; wr_done <= 1'b0; enq_done <= 1'b0;
+      span_v <= 1'b0; wq_lo <= 15'd0; wq_hi <= 15'd0;
+    end else begin
+      // the span of addresses queued since the queue was last empty
+      if (wq_push) begin
+        span_v <= 1'b1;
+        if (!span_v || win_adr[14:0] < wq_lo) wq_lo <= win_adr[14:0];
+        if (!span_v || win_adr[14:0] > wq_hi) wq_hi <= win_adr[14:0];
+      end else if (!wq_busy) span_v <= 1'b0;
+      // the acknowledge: a flop, as wr_done was -- one cycle after the push
+      enq_done <= (io_wr && sel_buf) && (enq_done || wq_push);
+      wr_done  <= 1'b0;
+      if (!wq_v) begin
+        wr_hi <= 1'b0; wr_pend <= 1'b0;                     // nothing to write
+      end else if (bufw_ack && wr_pend) begin
+        wr_pend <= 1'b0;                                    // drop the request
+        wr_hi   <= !wr_hi;                                  // high half next, or the next word
+      end else if (!wr_pend) begin
+        wr_pend <= 1'b1;                                    // raise the next one
+      end
+    end
+  end
+  assign bw_data   = wq_q[31:0];
+  assign bw_addr   = wq_q[46:32];
+  assign bw_ack    = enq_done;
+  assign wq_busy   = wq_held || wr_pend;
+  assign buf_rd_ok = !wq_busy || !span_v
+                   || (win_adr[14:0] < wq_lo) || (win_adr[14:0] > wq_hi);
+  end endgenerate
+  // THE WRITE HALF IS DEFERRED, AND THIS IS A TIMING DECISION, NOT A DESIGN
+  // ONE. Port 9 was read-only until R133; giving it a write widened the logic
+  // feeding m2_sdram's `cmd` and the 96 MHz domain stopped closing -- four
+  // seeds at -0.253, -0.314, -0.381, worsening, with the worst path
+  // xfer_addr/be_r -> cmd[0] INSIDE the controller.
+  //
+  // The READ half is the correctness fix and it stays: the coprocessor was
+  // reading an invented map (base from io 0x2e, target from offset bit 15,
+  // rf 3 discarded). Nothing yet depends on the write half -- the geometrizer
+  // that would consume what the copro stores does not exist -- so it is worth
+  // no timing at all today. It lands with the geometrizer, and the way to
+  // land it is off the arbiter entirely: through the shared write port, as
+  // m2_geo already does. Study R133.
+  assign dat_req    = io_rd && (sel_rom || (sel_buf && buf_rd_ok));   // R888
+  assign dat_we     = 1'b0;      // port 9 stays READ ONLY
+  assign bufw_req   = wr_pend;
+  assign bufw_addr  = 19'({3'd0, bw_addr, wr_hi});
+  assign bufw_data  = wr_hi ? bw_data[31:16] : bw_data[15:0];
+  assign dat_wdata  = wr_hi ? bw_data[31:16] : bw_data[15:0];
+  assign dat_is_buf = sel_buf;
+  // R888: a read's half is 0 (port 9 reads the pair at an even address); with
+  // posted writes wr_hi can be 1 while a data-ROM read goes out.
+  assign dat_half   = (BUFW_Q == 0) ? wr_hi : 1'b0;
+  // index = (base & ~0x7fff) | offset, masked to the ROM's word count.
+  // The reference masks each region to its own size: the data ROM by its
+  // dword count, bufferram by 0x7fff. 19 bits carries either.
+  // TWENTY BITS FOR THE ROM, NOT NINETEEN. The reference masks the data-ROM
+  // index by the region's own dword count -- `adr &= (bytes >> 2) - 1` -- and
+  // Daytona's copro data ROM is 0x400000 bytes, which is 0x100000 dwords and
+  // needs 20 bits. At 19 the coprocessor could reach only the bottom HALF of
+  // its data ROM and the top half aliased onto it, so every lookup above
+  // 2 MB returned the wrong dword -- plausible values, never a fault, exactly
+  // the failure R133 describes: the right program reading the wrong memory.
+  assign dat_addr = sel_buf ? 20'({5'd0, win_adr[14:0]})
+                            : 20'(win_adr[19:0]);
+
+  // The copro RAM window drives m1_copro_if. Held until its acknowledge.
+  assign ram_req   = (io_rd || io_wr) && sel_rdat;
+  assign ram_we    = io_wr && sel_rdat;
+  assign ram_addr  = copro_adr[radr_i][12:0];
+  assign ram_wdata = io_wdata;
+
+  always_comb begin
+    io_rdata = 32'd0;
+    if      (sel_radr) io_rdata = copro_adr[radr_i];
+    else if (sel_rdat) io_rdata = ram_rdata;
+    // MATH_ZERO forces every math unit to answer zero. It was the switch that
+    // established the units were the blocker while they were unimplemented; it
+    // is kept only so that experiment can be repeated, and the default path is
+    // now the real function.
+    else if (sel_math) io_rdata = MATH_ZERO ? 32'd0 : math_val;
+    else if (sel_rom || sel_buf) io_rdata = dat_rdata;
+  end
+
+  // Register reads and writes finish immediately; anything behind memory waits.
+  assign io_ack = sel_radr ? (io_rd || io_wr)
+                : sel_rdat ? ram_ack
+                : sel_math ? (io_wr || tbl_ack)
+                // 0x2e ACKS READS TOO, AND THIS HALTED THE COPROCESSOR.
+                //
+                // a windowed WRITE finishes on the second half only
+                // a write into the window is accepted and dropped, as the ROM
+                // half already is -- see the note on dat_req above
+                : sel_buf ? (io_wr ? bw_ack : dat_ack)   // R888
+                // A WRITE TO THE ROM HALF IS DROPPED AND COMPLETES. The
+                // reference only stores when the effective address sets bit 22:
+                // copro_tgp_memory_w does nothing at all for the ROM bank. This
+                // read `sel_rom ? dat_ack` for both directions, so a write
+                // issued no request and then waited for its acknowledge --
+                // measured on the board as io_addr=7ffc, io_wr=1, io_ack=0.
+                : sel_rom ? (io_wr ? 1'b1 : dat_ack)
+                : (io_rd || io_wr);   // unmapped, AS_RF LEDs, bank clear
+
+  assign dbg_io_addr = io_addr;
+  assign dbg_io_rd   = io_rd;
+  assign dbg_io_wr   = io_wr;
+  assign dbg_io_ack  = io_ack;
+
+  // WHICH INPUT HANDS THE TGP ALL-ONES? R146: the mailbox word is a computed
+  // float result, and ours is 0xFFFFFFFF where MAME's is 0. A float pipeline
+  // emits all-ones when an operand is all-ones, and the standing rule is that
+  // unwritten memory reads 0xFFFF -- so count every completed io READ that
+  // returned 0xFFFFFFFF, by source. The source that is non-zero is the bug.
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      dbg_ff_math <= 16'd0; dbg_ff_rom <= 16'd0; dbg_ff_buf <= 16'd0; dbg_rd_total <= 16'd0;
+    end else if (io_rd && io_ack) begin
+      if (!(&dbg_rd_total)) dbg_rd_total <= dbg_rd_total + 16'd1;
+      if (io_rdata == 32'hFFFFFFFF) begin
+        if (sel_math && !(&dbg_ff_math)) dbg_ff_math <= dbg_ff_math + 16'd1;
+        if (sel_rom  && !(&dbg_ff_rom))  dbg_ff_rom  <= dbg_ff_rom  + 16'd1;
+        if (sel_buf  && !(&dbg_ff_buf))  dbg_ff_buf  <= dbg_ff_buf  + 16'd1;
+      end
+    end
+  end
+  assign dbg_fifo_rd = fifo_rd;
+  assign dbg_fifo_wr = fifo_wr;
+
+  // R923: the probe's handshake word and the output-FIFO drop count
+  assign dbg_hs = {sw_done && rel_done, core_state, io_rd, io_wr, io_ack,
+                   tbl_req, tbl_ack, dat_req, dat_ack,
+                   bufw_req, bufw_ack, wq_busy, bw_ack,
+                   fifo_rd, fifo_wr, fifo_ack, popped, pushed,
+                   fifo_in_valid, fifo_out_full, sel_buf, sel_rom,
+                   sel_math, buf_rd_ok, wr_hi, 3'd0, dbg_unimplemented};
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) dbg_out_refused <= 16'd0;
+    else if (!OUT_STALL && fifo_wr && fifo_out_full && !pushed && !(&dbg_out_refused))   // R931: a loss, not a hold
+      dbg_out_refused <= dbg_out_refused + 16'd1;
+  end
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      for (int i = 0; i < 4; i++) copro_adr[i] <= '0;
+      dbg_retires <= '0; dbg_pc <= '0;
+    end else begin
+      if (io_wr && sel_radr) copro_adr[radr_i] <= io_wdata;
+
+      // THE TGP's INCREMENT: unconditional, and by four when bit 18 is set.
+      // Not the V60's rule — see the header. MAME does this on both the read
+      // and the write handler.
+      if (ram_ack && sel_rdat)
+        copro_adr[radr_i] <= copro_adr[radr_i]
+                           + (copro_adr[radr_i][18] ? 32'd4 : 32'd1);
+
+      if (retire) begin
+        dbg_pc <= retire_pc;
+        // WRAPS, DELIBERATELY, rather than saturating.
+        //
+        // A saturated counter cannot answer the only question worth asking of
+        // it on a running board — is this thing still executing? It read FFFF
+        // for two sessions while the coprocessor's state was in doubt, and
+        // could not distinguish "retired 65,535 instructions and stopped" from
+        // "still going". A wrapping counter visibly churns when it is alive and
+        // sits still when it is not.
+        dbg_retires <= dbg_retires + 16'd1;
+      end
+    end
+  end
+
+endmodule

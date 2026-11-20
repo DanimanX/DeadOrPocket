@@ -147,7 +147,26 @@ Full place-and-route and 4-corner Static Timing Analysis of [`src/fpga/pocket_de
 ### Phase 2 Verilator Co-Simulation Findings
 - **Full 4-channel bus & render co-sim (`sim/tb_hybrid_bus_top.sv`):** Verified `7,445 TX / 7,445 RX` bus words with **0 bus contention cycles**, **0 JEDEC SDRAM violations** (`1,040 reads`, `1,024 writes`), **2,441/2,441 bit-exact CH2 PCM audio samples**, **3/3 CH3 VBlank input roundtrips**, and **189,115 / 190,080 3D pixels rendered** (including live bilinear-filtered `TEXS0` texture fetches uploaded over CH1).
 - **Real Model 2A-CRX i960 ROM boot (`sim/tb_m2a_cart_top.sv`):** Verified real *Virtua Fighter 2* (`vf2.rom`) executing **1,698,138 i960 accesses** (`0 traps`, `0 halts`) and streaming **80,121 live CH1 video writes** (`145,547` bus words, **0 contention**) into Pocket `m2_video`, plus *Dead or Alive* (`doaab.rom`) executing **3,185,370 i960 accesses** (`0 traps`, `0 halts`, `FR=1, F2A=1`).
-- **Phase 3 Protocol Enhancement Note:** Under synthetic 2,048-quad continuous back-to-back stress (`--stress`), sharing a single Pocket RX FIFO between CH0 quads and CH2 audio means CH0 backpressure when `m2_raster3d` drops `q_ready` can delay CH2 audio if the cartridge emits quads before VBlank. In Phase 3, exposing a 1-bit `R3D_Q_READY` status flag in `CH3` (so `m2_cart_host` gates CH0 quad bursts while keeping CH2 audio flowing) guarantees 100% non-blocking audio even under pathological mid-frame double-flips.
+- **Phase 3 Protocol Enhancement Note:** Under synthetic 2,048-quad continuous back-to-back stress (`--stress`), sharing a single Pocket RX FIFO between CH0 quads and CH2 audio means CH0 backpressure when `m2_raster3d` drops `q_ready` can delay CH2 audio if the cartridge emits quads before VBlank. Exposing a 1-bit `R3D_Q_READY` status flag in `CH3` (so `m2_cart_host` gates CH0 quad bursts while keeping CH2 audio flowing) guarantees 100% non-blocking audio even under pathological mid-frame double-flips.
+
+## 4.2 Phase 3 Verified Compute Cartridge Silicon Fit (`5CEBA5F23C8` · Quartus Prime 25.1 Lite)
+
+Full place-and-route and 4-corner Static Timing Analysis of the complete Sega Model 2A-CRX Compute Cartridge ([`src/cart_fpga/cart_deadorpocket.qpf`](../src/cart_fpga/cart_deadorpocket.qpf), top-level [`m2_cart_top.sv`](../src/cart_fpga/cart_rtl/m2_cart_top.sv), hardware specification in [`docs/CARTRIDGE_HARDWARE.md`](CARTRIDGE_HARDWARE.md)) targeting Intel Cyclone V **`5CEBA5F23C8`** (pin-compatible with `5CEBA7F23C8`, FBGA-484):
+
+- **Logic utilization (ALMs):** `23,673 / 29,080` (**81%**, leaving **5,407 ALMs free** for Model 2 `m2_ioz80` + FAT32 MicroSD loader)
+- **Total registers:** `24,079`
+- **Total block memory bits:** `1,425,597 / 4,567,040` (**31%**)
+- **Total M10K RAM blocks:** `190 / 446` (**43%**)
+- **Total DSP blocks:** `13 / 150` (**9%**)
+- **Total PLLs:** `1 / 6` (**17%**)
+- **Total User I/O Pins:** `77 / 240` (**32%**)
+- **4-Corner STA (`Slow 85C`, `Slow 0C`, `Fast 85C`, `Fast 0C`):** **0.000 ns TNS** across all 4 clock domains (`clk_mem` 100 MHz `+2.160 ns` / Fmax `127.55 MHz`, `clk_sys` 50 MHz `+6.184 ns` / Fmax `73.29 MHz`, `clk_cpu` 25 MHz `+8.248 ns` / Fmax `36.50 MHz`, `clk_bus` 31.97 MHz `+25.709 ns` / Fmax `179.50 MHz`, worst hold `+0.120 ns`, worst-case MTBF `1e+09 years`, 0 STA warnings).
+
+### Verified Dual-FPGA Totals (`5CEBA5F23C8` + `5CEBA4F23C8`)
+- **Total Logic:** `34,236 / 47,560 ALMs` (**72%**) · `38,574 registers`
+- **Total Block RAM:** `493 / 754 M10K` (**65%**)
+- **Total DSP:** `68 / 216 DSP` (**31%**)
+- **Timing Sign-Off:** **0.000 ns TNS across all 4 PVT corners on both FPGAs.**
 
 ---
 

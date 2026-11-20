@@ -1,0 +1,1485 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Sega Model 2 core for MiSTer FPGA
+// Copyright (C) 2026 alphanu1
+//
+// The i960's bus, decoded and brought into the memory clock domain.
+//
+// WHY A BRIDGE AND NOT A DECODER
+//
+// The CPU runs at 25 MHz because that is what it fits at -- 26.4 MHz measured,
+// study R23 -- and everything it talks to runs at 40 MHz with the SDRAM. A
+// clock enable would not help: with an enable the logic still has to settle
+// inside one 40 MHz period, and it does not. So there is a domain crossing, and
+// the honest place for it is here, once, rather than scattered through the top
+// level.
+//
+// THE CROSSING IS A FOUR-PHASE HANDSHAKE, deliberately, not a FIFO. The i960
+// bus is already request/acknowledge and it stalls until it is answered, so a
+// FIFO would buy nothing and cost a pointer pair in each direction. `req`
+// crosses into the memory domain through two flops, the payload is held stable
+// by the requester for the whole transaction and is NOT synchronised -- it is
+// stable long before `req` arrives -- and `ack` crosses back the same way.
+//
+// docs/mister-integration.md: ONE ACCESS IS `req & ack`, NOT ONE CYCLE OF
+// `req`. A side-effecting target must act on the handshake. The Model 1 TGP
+// popped every FIFO word twice and deadlocked on hardware for exactly this.
+// The `busy` flag below is what makes each crossing fire once.
+//
+// THE MEMORY MAP IS model2o, NOT 2A-CRX. daytona93 runs on the original Model 2
+// board and the two differ where it matters (study R25):
+//
+//   model2o:  0x00200000-0x0021ffff  RAM, 128 KB
+//             0x00220000-0x0023ffff  ROM MIRROR of program ROM + 0x20000
+//   2A-CRX:   0x00200000-0x0023ffff  RAM, 256 KB
+//
+// Selected by a parameter rather than assumed, because getting it wrong is not
+// visible for half a million instructions and then looks like a decoder fault.
+
+`timescale 1ns/1ps
+
+// DCACHE_EN LETS THE CACHE BE TAKEN OUT OF THE PATH ENTIRELY.
+//
+// Every observation of the byte smear at 0x501084 comes from a build that
+// already had the data cache, so it has never been excluded as the CAUSE. With
+// this at 0 the read path is exactly what it was before the cache existed --
+// unaligned single burst, r_addr[1] halfword selection -- and the board can say
+// whether the smear survives without it. Simulation cannot answer this: it
+// reads the value correctly either way.
+// BUFFERRAM IS OFF, AND THAT IS A FINDING RATHER THAN AN OMISSION (R129).
+//
+// The mapping below is correct and was verified live -- the boot profile
+// shifts measurably when it is on. It is disabled because IT CANNOT LAND
+// ALONE. 0x00900000 is the GEOMETRIZER'S WORKSPACE: the game writes a
+// structure there, reads it back and follows it. Unmapped, the reads
+// returned 0 and the machine took a safe path (21,325 TGP retires, attract
+// cycling). Mapped, the writes LAND, the game follows its own pointer, and
+// with no geometrizer behind it the i960 livelocks at IP 0x0E00-0x0E10
+// walking an unmapped 0x0163FBxx (1,367 retires, attract stopped).
+//
+// Initialising the RAM to the reference's 0x07800f0f changed NOTHING --
+// byte-identical telemetry -- which is what rules out the contents and
+// names the writes landing as the cause. Turn this on in the same change
+// that brings up the geometrizer, not before.
+module m2_cpu_bridge #(
+  parameter bit DCACHE_EN = 1'b1,
+  parameter bit BUFFERRAM = 1'b0,
+  parameter bit BUFFERRAM_WRONLY = 1'b0,   // writes land, reads still read 0
+  parameter bit BUFFER_NOCACHE   = 1'b1,   // buffer-RAM lines are never retained
+  parameter int unsigned AW = 25,        // SDRAM word address width
+  parameter bit          BOARD_2A = 0,   // 0 = model2o, 1 = 2A-CRX
+  // R576: 1 when clk_cpu is NOT an exact /2 of clk_mem (the i960 at 35.3 MHz
+  // against a 60 MHz core): R460's two synchroniser flops each way, as the
+  // i960 at 30 against 50 had. 0 keeps R464's single flop, sound only at 2:1.
+  parameter bit          ASYNC    = 0,
+  // R748: 1 = R730's same-cycle answers; 0 = R729's registered ones.
+  // R753: 0. With R730 the game traps at 0x1868 in attract after 4-45 min
+  // (four locks); with it off two soaks ran 50 and 48 min without one.
+  parameter bit          FAST_ACK = 1'b0,
+  // R728: the CPU-side code cache (program ROM lines, 8 KB). 0 = R724 alone.
+  // R733: OFF. On the board it stops Daytona on its boot settings screen
+  // (s764), which no bench reproduces; with it off the data cache is 16 KB
+  // again and the bridge is R724 + R729 + R730.
+  parameter bit          CC_EN    = 1'b0
+) (
+  // ------------------------------------------------- CPU domain (25 MHz)
+  input  logic        clk_cpu,
+  input  logic        rst_n_cpu,
+
+  input  logic        bus_req,
+  // R724: this request is an INSTRUCTION fetch (i960_top's G_IC grant). Such
+  // reads are served a 16-byte line at a time through `lb` below.
+  input  logic        bus_ifetch,
+  input  logic        bus_we,
+  input  logic [31:0] bus_addr,
+  input  logic  [3:0] bus_be,
+  input  logic [31:0] bus_wdata,
+  output logic [31:0] bus_rdata,
+  output logic        bus_ack,
+
+  // ------------------------------------------------- memory domain (40 MHz)
+  input  logic        clk_mem,
+  input  logic        rst_n_mem,
+
+  // Where the ROM images live in SDRAM, in 16-bit words.
+  input  logic [AW:1] base_prog,         // program ROM,   0x00000000
+  // R726: VIRTUA COP'S PROGRAM IS 512 KB, Daytona's 256. Its second half
+  // (0x40000-0x7FFFF) is appended after the '93 image and lands at base_progx;
+  // prog_ext (the core's game ID says Virtua Cop) is the ONLY thing that sends
+  // reads there, so Daytona's view of the program region is unchanged.
+  // R862: on the 2A board (BOARD_2A) prog_ext sends 0x80000-0x1FFFFF to
+  // base_progx + the CPU's word, base_progx being the extension's slot less
+  // 0x40000 words (Sega Rally, Virtua Cop 2, Zero Gunner); VF2 does not set it.
+  input  logic        prog_ext,
+  input  logic [AW:1] base_progx,
+  input  logic [AW:1] base_data,         // main_data,     0x02000000
+  input  logic [AW:1] base_work,         // work RAM,      0x00500000
+  input  logic [AW:1] base_board,        // board RAM,     0x00200000
+  input  logic [AW:1] base_char,         // char RAM,      0x01080000
+  // THE SHARED BUFFER, 0x00900000, AND IT WAS NOT MAPPED AT ALL.
+  //
+  // `map(0x00900000,0x0091ffff).mirror(0x60000).ram().share("bufferram")` --
+  // 128 KB of plain RAM, and the region this core routed to T_IO, whose read
+  // mux ends in 32'd0. So every read returned zero and every write vanished.
+  // Measured in MAME over 900 attract frames: 33,554 writes and 12,269 reads.
+  // It is not only the i960's: the coprocessor reads the same memory through
+  // its bank at 0x400000, so this is how the two SHARE DATA, and neither side
+  // could see it. 128 KB will not fit in M10K here (~103 blocks against 40
+  // free after the band buffers), so it lives in SDRAM.
+  input  logic [AW:1] base_buffer,       // bufferram,     0x00900000
+  // THE 3D COLOUR DATA, MIRRORED INTO SDRAM (R222). The polygon's colour is
+  // palette entry 0x1000 + colorbase (10 bits) run through the 48 KB colour
+  // translation table, and the geometry engine can reach neither: the
+  // palette's second port is the tile pipeline's every pixel, and the
+  // translation table was kept only as the 96 entries the tiles read. So
+  // palette entries 0x1000-0x13ff (bytes 0x2000-0x27ff of T_PAL) are ALSO
+  // written to base_pal3d, and every T_XLAT write goes to base_xlat3d, both
+  // through the ordinary SDRAM write path (write-through, invalidate) -- the
+  // on-chip palette write and the 96-entry tap still happen beside them.
+  // Reads of both ranges come back from the mirror.
+  input  logic [AW:1] base_pal3d,        // 1 K words
+  input  logic [AW:1] base_xlat3d,       // 24 K words
+  // R264: the two texture sheets and the polygon luma table. Daytona uploads
+  // its textures by ORDINARY CPU STORES to 0x12000000 and 0x12400000, and the
+  // reference keeps only the low 16 bits of each 32-bit store -- tex0_w packs
+  // two of them per dword. This core did not decode those addresses at all, so
+  // every texture the game has ever uploaded went to the unmapped default and
+  // was counted and discarded.
+  input  logic [AW:1] base_texs0,        // 1 MB, 16-bit words
+  input  logic [AW:1] base_texs1,        // 1 MB
+  input  logic [AW:1] base_luma,         // 32 K bytes, one per 16-bit word
+
+  // SDRAM port. Sixteen bits wide, so a 32-bit access is TWO transactions --
+  // the sequencer below issues the low half then the high half.
+  //
+  // Only sd_dout[15:0] is read. Port 0 is a SINGLE-WORD port -- m2_sdram's
+  // blen() is hardcoded per port and gives ports 0 and 4 one word where 1-3
+  // burst four -- so the upper 48 bits are not populated on this port, and
+  // reading them would return whatever the previous burst left. Model2.sv's
+  // comment records a readback that got a correct low half and a permanently
+  // zero upper half from exactly this confusion.
+  /* verilator lint_off UNUSEDSIGNAL */
+  output logic        sd_req,
+  output logic        sd_we,
+  output logic [AW:1] sd_addr,
+  output logic [15:0] sd_din,
+  output logic  [1:0] sd_be,
+  input  logic [63:0] sd_dout,
+  /* verilator lint_on UNUSEDSIGNAL */
+  input  logic        sd_ack,
+
+  // On-chip tile RAM and palette, 16-bit, one word per access.
+  output logic        oc_tram_we,
+  output logic        oc_pal_we,
+  output logic [14:0] oc_addr,
+  output logic [15:0] oc_din,
+  input  logic [15:0] oc_tram_q,
+  input  logic [15:0] oc_pal_q,
+
+  // Colour translation table, 96 entries.
+  // A WRITE LANDED IN THE CHAR REGION, so the glyph cache in front of it must
+  // drop what it holds. Without this it serves pre-upload zeros forever.
+  output logic        char_wr,
+  // Which glyph word, so the cache drops ONE line instead of everything. The
+  // same [18:1] slice the SDRAM address is formed from, so the two cannot
+  // disagree about which word was written.
+  output logic [17:0] char_wr_addr,
+  output logic        oc_xlat_we,
+  output logic  [6:0] oc_xlat_addr,
+  output logic  [7:0] oc_xlat_din,
+  output logic        col_inval,        // R222: a mirrored colour write happened (one pulse)
+  // R266: this write landed in the display list, so anything caching a word of
+  // it must drop the copy. The walker reads the list through a one-entry pair
+  // cache and the game patches a command's count in after pushing its payload.
+  output logic        buf_inval,
+  // R275: the CPU wrote a texture sheet. The texel cache holds lines of sheet
+  // data and the game UPLOADS its textures, so a line filled before an upload
+  // is stale for the rest of the session -- the glyph cache's blank screen in
+  // a different memory (R266).
+  output logic        tex_inval,
+
+  // I/O the core answers itself.
+  input  logic [31:0] io_rdata,
+  // AN I/O TARGET MAY REFUSE TO COMPLETE, AND THE CPU MUST WAIT FOR IT.
+  //
+  // Every peripheral before this one answered in the cycle it was selected, so
+  // the sequencer never had to ask. The coprocessor's input FIFO is different:
+  // it is EIGHT DEEP AND IT IS THE FLOW CONTROL. MAME's generic_fifo never
+  // drops -- push() into a full FIFO queues the value and HALTS THE SOURCE --
+  // and this core dropped 429,406 of the i960's commands in one boot because a
+  // full FIFO looked like an overflow to guard against rather than a brake to
+  // obey.
+  //
+  // While io_stall is high the access is held: io_sel stays asserted, no
+  // acknowledge is returned, and the i960 waits exactly as it would on a real
+  // bus that is not ready. It costs nothing when nothing stalls.
+  input  logic        io_stall,
+  // R697: the geometrizer's push queue still holds words for buffer RAM. A
+  // store INTO buffer RAM waits for it: Daytona pushes a zero placeholder
+  // through the queue and then patches the count with a direct store (R254),
+  // and a store that overtook a queued placeholder was overwritten by it.
+  input  logic        buf_wr_stall,
+  output logic        io_sel,
+  output logic        io_we,
+  output logic [31:0] io_addr,
+  output logic [31:0] io_wdata,
+  // THE BYTE LANES, forwarded rather than dropped. The I/O board's dual-port
+  // RAM is eight bits wide at bytes 0 and 2 of each dword, so a `stob` to
+  // 0x01c00040 must not disturb the status byte at 0x01c00042 -- and without
+  // these an I/O write is all four lanes, which would have the CPU clearing
+  // the board's own reply every time it raised a command.
+  output logic  [3:0] io_be,
+
+  // Observability. A core that decodes nothing looks identical to a core whose
+  // CPU is not running, and both present as a black screen.
+  output logic [31:0] dbg_cpu_reads,
+  output logic [31:0] dbg_cpu_writes,
+  output logic [31:0] dbg_unmapped,
+
+  // The last SDRAM word address issued and the last data captured. Reads are
+  // being issued, decoded correctly and coming back ZERO on hardware, and those
+  // three facts together do not say whether the address is wrong or the data
+  // is. These do.
+  output logic [31:0] dbg_last_addr,
+  output logic [31:0] dbg_last_dout,
+
+  // WHAT THIS BRIDGE GETS FOR WORDS 6 AND 2, latched the first time each is
+  // read. The ROM readback reads word 6 through the same controller and gets
+  // 00000860; this bridge gets zero. Same address, two readers, one number
+  // each -- the only way left to tell a bad read from a bad address.
+  // EEEEEEEE means the address was never read at all, which is a different
+  // fault from reading it and getting zero.
+  output logic [31:0] dbg_probe6,
+  output logic [31:0] dbg_probe2,
+  // Writes the CPU has made to TILE RAM and to the palette. The probes
+  // above proved the read path; these say whether anything is being drawn
+  // at all, which a screenful of noise cannot distinguish from drawing to
+  // the wrong place.
+  output logic [31:0] dbg_tram_wr,
+  output logic [31:0] dbg_pal_wr,
+  // The memory side's own view: its state, and the three signals the
+  // handshake turns on. Inferring these from the CPU side is what has been
+  // failing.
+  output logic  [7:0] dbg_mstate,
+  // R721: the transaction in flight, sampled by the telemetry beside the IP:
+  //   {req_mem, tgt[2:0], r_we, st[3:0], r_addr[23:16]}
+  output logic [16:0] dbg_sample,
+  // The data cache's own telemetry. Modelled at 97.86% before it was built;
+  // the board must be able to say whether it agrees, because a simulated hit
+  // rate that hardware did not share is exactly what the glyph cache did
+  // (96.7% modelled against 51.8% measured).
+  output logic [31:0] dbg_dc_hits,
+  output logic [31:0] dbg_dc_miss
+);
+
+  // ------------------------------------------------------------ CDC: request
+  //
+  // The payload registers are written in the CPU domain while `req_cpu` is low
+  // and read in the memory domain only after `req_mem` has been high for two
+  // flops, so they are stable for far longer than the crossing takes. That is
+  // the standard condition for not synchronising a data bus, and it is the
+  // reason this is a handshake rather than a FIFO.
+  logic        req_cpu;
+  typedef enum logic [2:0] { C_IDLE, C_WAIT, C_CLR, C_POST, C_CC } cph_e;   // R728: C_CC
+  cph_e cph;
+  logic        req_mem, ack_mem;
+  // R729: A TWO-PHASE (TOGGLE) HANDSHAKE, as Model 1's m1_cdc_port and R693.
+  // req_cpu flips once per access and ack_mem once per completion; there is
+  // no return-to-zero, so an access ends at its acknowledge instead of two
+  // more crossings later. The flops and the payload rule are unchanged: r_*
+  // are written with the toggle and cannot change until the completion
+  // toggle is back.
+  logic        ack_seen;         // the completion toggle last consumed (CPU side)
+  logic        req_seen;         // the request toggle last taken (memory side)
+  logic        ack_mem_d;        // R698: ack_mem a cycle ago, to see a completion
+  logic        ack_cpu;          // ack_mem, one CPU flop later
+  logic  [1:0] ack_cpu_s;        // R576: its synchroniser when ASYNC
+
+  logic        r_we;
+  logic [31:0] r_addr, r_wdata;
+  logic  [3:0] r_be;
+  logic [31:0] r_rdata;
+  // R724: THE INSTRUCTION LINE BUFFER (CPU side). A race's i960 spent 27.8% of
+  // its time on instruction fetches and only a sixth of that at the SDRAM
+  // (R722): i960_icache fills a 16-byte line as four requests, each a full
+  // four-phase round trip. An instruction fetch that misses `lb` now asks the
+  // memory side for the whole line in ONE transaction; the line's other words
+  // are answered from `lb` on the CPU side with no crossing at all. Code runs
+  // from ROM (i960_icache's premise too), but a CPU write into the buffered
+  // line still drops it.
+  logic         r_line;        // the request in flight wants the whole line
+  logic         lb_v;
+  logic [27:0]  lb_tag;        // bus_addr[31:4] of the buffered line
+  logic [127:0] lb;
+  logic         l_ok;          // memory side: l_data holds this request's line
+  logic [127:0] l_data;
+
+  // R728: A CODE CACHE ON THE CPU SIDE. R724 made a line fill one round trip;
+  // the round trip itself stayed, and in a race the code does not fit the
+  // i960's 512 B instruction cache: half the race's time is in ~1.8 KB of
+  // program ROM, three quarters in ~5 KB (s751's IP samples; 98% of it below
+  // 0x200000). So the lines an instruction fetch brings back are KEPT here,
+  // in the CPU's own clock, and a later miss in i960_icache that finds its
+  // line here is answered in two cycles with no crossing at all.
+  //
+  // Program ROM only, so there is nothing to keep coherent: no master writes
+  // it after the load, and the load holds the CPU -- and this bridge -- in
+  // reset, after which the sweep below clears every entry. Direct-mapped,
+  // 512 lines of 16 B, {valid, addr[20:13], line} in one M10K array (7 blocks
+  // at 512 x 20); the blocks are the memory side's data cache halved.
+  localparam int unsigned CC_LINES = 512;
+  localparam logic [31:0] CC_TOP   = 32'h0020_0000;      // the program ROM decode
+  (* ramstyle = "M10K, no_rw_check" *) logic [136:0] cc_mem [CC_LINES];
+  logic [136:0] cc_q;
+  logic         cc_we;
+  logic [8:0]   cc_wa;
+  logic [136:0] cc_wd;
+  logic         cc_sweeping;
+  logic [8:0]   cc_sweep;
+  // A fetch the cache may answer: decided from the request as presented, so
+  // the array's address is bus_addr itself and the answer is there next cycle.
+  wire cc_can = CC_EN && !cc_sweeping && bus_ifetch && !bus_we && (bus_addr < CC_TOP);
+  wire cc_hit = cc_q[136] && (cc_q[135:128] == r_addr[20:13]);
+  always_ff @(posedge clk_cpu) begin
+    cc_q <= cc_mem[bus_addr[12:4]];
+    if (cc_we) cc_mem[cc_wa] <= cc_wd;
+  end
+
+  // R748: R730's combinational answers are FAST_ACK = 1; 0 is R729's registered
+  // answers, verbatim (lb_gap, the own-ack guard, posted) -- the board's
+  // T_TRAP at 0x1868 (R747/R748) is being bisected between them.
+  generate if (FAST_ACK) begin : g_fast
+  // R730: THE ANSWER LEAVES IN THE CYCLE IT EXISTS. bus_ack and bus_rdata were
+  // registered, so every answer reached the i960 a cycle after the bridge had
+  // it -- and the cycle after THAT was lost too, because the requester moves
+  // its address on the ack and the bridge had to sit out the cycle the old
+  // address was still showing (R724's lb_gap, R729's own-ack guard). They are
+  // now combinational from the state that holds the answer:
+  //   lb_fast  an instruction word from the line buffer (R724), from bus_addr
+  //   cc_fast  the code cache's hit (R728), in C_CC
+  //   rd_fast  a completed crossing, in C_WAIT (r_rdata, or the line)
+  //   wr_fast  a write, posted in the cycle it is presented (C_IDLE)
+  // The requester sees the ack in the same cycle and moves at that edge, so
+  // the next cycle always carries the next request: there is no stale cycle
+  // left to guard. No loop: every i960 master drives bus_req and bus_addr
+  // from registers (i960_lsu S_XFER and cur_addr, i960_icache fill_base and
+  // fill_word, i960_top grant_q), and grant_q already takes an ack in the
+  // cycle a request first appears.
+  function automatic logic [31:0] word_of(input logic [127:0] l, input logic [1:0] w);
+    case (w)
+      2'd0: word_of = l[31:0];
+      2'd1: word_of = l[63:32];
+      2'd2: word_of = l[95:64];
+      default: word_of = l[127:96];
+    endcase
+  endfunction
+  wire lb_fast = (cph == C_IDLE) && bus_req && !bus_we && bus_ifetch && lb_v
+                 && (bus_addr[31:4] == lb_tag);
+  wire wr_fast = (cph == C_IDLE) && bus_req && bus_we;
+  wire cc_fast = (cph == C_CC) && cc_hit;
+  wire rd_fast = (cph == C_WAIT) && (ack_cpu != ack_seen);
+  assign bus_ack   = lb_fast || wr_fast || cc_fast || rd_fast;
+  assign bus_rdata = lb_fast ? word_of(lb, bus_addr[3:2])
+                   : cc_fast ? word_of(cc_q[127:0], r_addr[3:2])
+                   : (r_line && l_ok) ? word_of(l_data, r_addr[3:2])
+                   : r_rdata;
+
+  always_ff @(posedge clk_cpu or negedge rst_n_cpu) begin
+    if (!rst_n_cpu) begin
+      req_cpu <= 1'b0; cph <= C_IDLE; ack_cpu <= 1'b0; ack_seen <= 1'b0;   // R729
+      r_line <= 1'b0; lb_v <= 1'b0; lb_tag <= '0;                 // R724
+      cc_we <= 1'b0; cc_wa <= '0; cc_wd <= '0;                    // R728
+      cc_sweeping <= CC_EN; cc_sweep <= '0;
+      ack_cpu_s <= 2'b00;                                   // R576
+
+      r_we <= 1'b0; r_addr <= 32'd0; r_wdata <= 32'd0; r_be <= 4'd0;
+    end else begin
+      // The same single flop in the other direction, for the same reason: one
+      // stage of settling, not two of synchronising. R576: two more when ASYNC.
+      ack_cpu_s <= {ack_cpu_s[0], ack_mem};
+      ack_cpu   <= ASYNC ? ack_cpu_s[1] : ack_mem;
+      // The i960 HOLDS bus_req high across a run of accesses and moves bus_addr
+      // ON THE ACK -- its boot walk reads mem[0], mem[4] and mem[12] without
+      // ever dropping the request -- so "a new request is present" is true
+      // continuously and cannot be used to separate one access from the next.
+      // Only the acknowledge can. (On hardware the four-phase version that
+      // forgot this read word 0 three times and booted from a zero IP.)
+      // R728: the reset sweep, one entry a cycle through the write port
+      cc_we <= 1'b0;
+      if (cc_sweeping) begin
+        cc_we <= 1'b1; cc_wa <= cc_sweep; cc_wd <= '0;
+        cc_sweep <= cc_sweep + 9'd1;
+        if (cc_sweep == 9'(CC_LINES - 1)) cc_sweeping <= 1'b0;
+      end
+      case (cph)
+        // R724: an instruction word from the buffered line is answered by
+        // lb_fast with no crossing and nothing to record here.
+        C_IDLE: if (bus_req && !lb_fast) begin
+          r_we    <= bus_we;
+          r_addr  <= bus_addr;
+          r_wdata <= bus_wdata;
+          r_be    <= bus_be;
+          r_line  <= bus_ifetch && !bus_we;                              // R724
+          if (bus_we && (bus_addr[31:4] == lb_tag)) lb_v <= 1'b0;        // R724: a write into the line
+          if (cc_can) cph <= C_CC;                                       // R728: look first
+          else begin
+            req_cpu <= ~req_cpu;                                         // R729
+            cph     <= bus_we ? C_POST : C_WAIT;
+
+          end
+        end
+        // R728: the code cache's answer, read on the way in. A hit (cc_fast)
+        // fills the line buffer from it; a miss goes to memory exactly as it
+        // would have, one cycle later.
+        C_CC: if (cc_hit) begin
+          lb     <= cc_q[127:0];
+          lb_tag <= r_addr[31:4];
+          lb_v   <= 1'b1;
+          cph    <= C_IDLE;
+        end else begin
+          req_cpu <= ~req_cpu;   // R729
+          cph     <= C_WAIT;
+        end
+        // The crossing has answered (rd_fast); keep a line that came back.
+        C_WAIT: if (ack_cpu != ack_seen) begin   // R729
+          ack_seen  <= ack_cpu;
+          if (r_line && l_ok) begin
+            lb     <= l_data;
+            lb_tag <= r_addr[31:4];
+            lb_v   <= 1'b1;
+            // R728: and keep it, if it is program ROM
+            if (CC_EN && !cc_sweeping && r_addr < CC_TOP) begin
+              cc_we <= 1'b1; cc_wa <= r_addr[12:4]; cc_wd <= {1'b1, r_addr[20:13], l_data};
+            end
+          end
+          cph       <= C_IDLE;     // R729: no return-to-zero
+        end
+
+        // A write was acknowledged as it was presented; the next access still
+        // waits for it to complete, so accesses stay in order.
+        C_POST: if (ack_cpu != ack_seen) begin ack_seen <= ack_cpu; cph <= C_IDLE; end   // R729
+        default: cph <= C_IDLE;   // R729: C_CLR is unreachable
+      endcase
+    end
+  end
+  end else begin : g_reg
+  logic        posted;
+  logic        lb_gap;  // lb_gap: the cycle after a buffer answer, when bus_addr has not moved yet
+  always_ff @(posedge clk_cpu or negedge rst_n_cpu) begin
+    if (!rst_n_cpu) begin
+      req_cpu <= 1'b0; bus_ack <= 1'b0; cph <= C_IDLE; ack_cpu <= 1'b0; ack_seen <= 1'b0;   // R729
+      r_line <= 1'b0; lb_v <= 1'b0; lb_gap <= 1'b0; lb_tag <= '0;   // R724
+      cc_we <= 1'b0; cc_wa <= '0; cc_wd <= '0;                    // R728
+      cc_sweeping <= CC_EN; cc_sweep <= '0;
+      ack_cpu_s <= 2'b00;                                   // R576
+      posted <= 1'b0;
+      r_we <= 1'b0; r_addr <= 32'd0; r_wdata <= 32'd0; r_be <= 4'd0;
+    end else begin
+      // The same single flop in the other direction, for the same reason: one
+      // stage of settling, not two of synchronising. R576: two more when ASYNC.
+      ack_cpu_s <= {ack_cpu_s[0], ack_mem};
+      ack_cpu   <= ASYNC ? ack_cpu_s[1] : ack_mem;
+      bus_ack  <= 1'b0;
+      // AN EXPLICIT FOUR-PHASE HANDSHAKE, because the condition-by-condition
+      // version kept racing. The phases are req-up, ack-up, req-down, ACK-DOWN,
+      // and the last one is the one that is easy to leave out: without it the
+      // next access starts while the previous acknowledge is still working its
+      // way back through the synchroniser and completes IMMEDIATELY on stale
+      // data, having never reached memory at all.
+      //
+      // The i960 makes this unforgiving. It HOLDS bus_req high across a run of
+      // accesses and moves bus_addr ON THE ACK -- its boot walk reads mem[0],
+      // mem[4] and mem[12] without ever dropping the request -- so "a new
+      // request is present" is true continuously and cannot be used to separate
+      // one access from the next. Only the acknowledge can.
+      //
+      // On hardware this read word 0 three times: SAT was right by luck, PRCB
+      // came back 0 and the boot took a zero IP.
+      lb_gap <= 1'b0;
+      // R728: the reset sweep, one entry a cycle through the write port
+      cc_we <= 1'b0;
+      if (cc_sweeping) begin
+        cc_we <= 1'b1; cc_wa <= cc_sweep; cc_wd <= '0;
+        cc_sweep <= cc_sweep + 9'd1;
+        if (cc_sweep == 9'(CC_LINES - 1)) cc_sweeping <= 1'b0;
+      end
+      case (cph)
+        C_IDLE: if (lb_gap) begin
+          // R724: the cycle after a buffer answer. The requester moves its
+          // address on the acknowledge, a cycle after it, so this cycle still
+          // shows the word just answered; serving it would answer it twice.
+        // R729: NOT ON THE CYCLE OUR OWN ACK IS UP. The i960 moves bus_addr at
+        // the end of the cycle it sees bus_ack, so a request seen then still
+        // carries the OLD address (m1_cdc_port's duplicate transaction; R693).
+        // The four-phase C_CLR used to hide it.
+        end else if (bus_req && !bus_ack && !bus_we && bus_ifetch && lb_v && (bus_addr[31:4] == lb_tag)) begin
+          // R724: an instruction word from the buffered line -- no crossing
+          case (bus_addr[3:2])
+            2'd0: bus_rdata <= lb[31:0];
+            2'd1: bus_rdata <= lb[63:32];
+            2'd2: bus_rdata <= lb[95:64];
+            default: bus_rdata <= lb[127:96];
+          endcase
+          bus_ack <= 1'b1;
+          lb_gap  <= 1'b1;
+        end else if (bus_req && !bus_ack) begin
+          r_we    <= bus_we;
+          r_addr  <= bus_addr;
+          r_wdata <= bus_wdata;
+          r_be    <= bus_be;
+          r_line  <= bus_ifetch && !bus_we;                              // R724
+          if (bus_we && (bus_addr[31:4] == lb_tag)) lb_v <= 1'b0;        // R724: a write into the line
+          if (cc_can) cph <= C_CC;                                       // R728: look first
+          else begin
+            req_cpu <= ~req_cpu;                                         // R729
+            cph     <= bus_we ? C_POST : C_WAIT;
+          end
+        end
+        // R728: the code cache's answer, read on the way in. A hit fills the
+        // line buffer from it and answers as the buffer does; a miss goes to
+        // memory exactly as it would have, one cycle later.
+        C_CC: if (cc_hit) begin
+          lb     <= cc_q[127:0];
+          lb_tag <= r_addr[31:4];
+          lb_v   <= 1'b1;
+          case (r_addr[3:2])
+            2'd0: bus_rdata <= cc_q[31:0];
+            2'd1: bus_rdata <= cc_q[63:32];
+            2'd2: bus_rdata <= cc_q[95:64];
+            default: bus_rdata <= cc_q[127:96];
+          endcase
+          bus_ack <= 1'b1;
+          lb_gap  <= 1'b1;
+          cph     <= C_IDLE;
+        end else begin
+          req_cpu <= ~req_cpu;   // R729
+          cph     <= C_WAIT;
+        end
+        C_WAIT: if (ack_cpu != ack_seen) begin   // R729
+          ack_seen  <= ack_cpu;
+          // R724: a line came back -- keep it, and answer the word asked for
+          if (r_line && l_ok) begin
+            lb     <= l_data;
+            lb_tag <= r_addr[31:4];
+            lb_v   <= 1'b1;
+            // R728: and keep it, if it is program ROM
+            if (CC_EN && !cc_sweeping && r_addr < CC_TOP) begin
+              cc_we <= 1'b1; cc_wa <= r_addr[12:4]; cc_wd <= {1'b1, r_addr[20:13], l_data};
+            end
+            case (r_addr[3:2])
+              2'd0: bus_rdata <= l_data[31:0];
+              2'd1: bus_rdata <= l_data[63:32];
+              2'd2: bus_rdata <= l_data[95:64];
+              default: bus_rdata <= l_data[127:96];
+            endcase
+          end else
+            bus_rdata <= r_rdata;
+          bus_ack   <= 1'b1;       // one cycle, which is what the i960 expects
+          cph       <= C_IDLE;     // R729: no return-to-zero
+        end
+
+        C_POST: begin
+          if (!posted) begin posted <= 1'b1; bus_ack <= 1'b1; end
+          if (ack_cpu != ack_seen) begin ack_seen <= ack_cpu; posted <= 1'b0; cph <= C_IDLE; end   // R729
+        end
+        // The fourth phase. Nothing starts until the acknowledge has gone away.
+        default: cph <= C_IDLE;   // R729: C_CLR is unreachable
+      endcase
+    end
+  end
+  end endgenerate
+
+  // NOT A CLOCK-DOMAIN CROSSING, AND THE DISTINCTION IS WORTH ~7 CYCLES AN
+  // ACCESS.
+  //
+  // clk_cpu and clk_mem come from ONE PLL at an exact 2:1 ratio -- 24 and 48
+  // MHz off the same VCO with integer dividers -- so their edges are aligned
+  // and every CPU-domain signal is stable across two memory cycles. There is
+  // no metastability here to synchronise away. m2_sdram_x2 makes exactly this
+  // argument for the 96/48 pair and carries no synchroniser for the same
+  // reason; this pair simply never had the argument applied to it.
+  //
+  // What the two flops cost: a four-phase handshake pays the synchroniser
+  // latency FOUR times -- req up, ack up, req down, ack down -- and the state
+  // histogram measured it as 7.12 cycles per transaction in S_DONE alone,
+  // against 4.42 for the SDRAM access it is wrapped around. With the data
+  // cache in front, protocol is essentially the whole cost of a memory access.
+  //
+  // The two hazards m2_sdram_x2 records still apply and are still handled:
+  // the acknowledge spans at least one slow cycle because S_DONE holds it
+  // until the request drops, and the request stays high for up to two fast
+  // cycles after the CPU sees the acknowledge, which is precisely what S_DONE
+  // is waiting out.
+  //
+  // ONE FLOP, NOT ZERO, AND THE TESTBENCH SAID SO.
+  //
+  // Sampling req_cpu directly broke two I/O reads, which came back holding the
+  // PREVIOUS transaction's value. The reason is in the original note above: the
+  // two flops were not only about metastability, they gave the PAYLOAD time to
+  // settle. r_addr is written in the CPU domain on the same edge req_cpu rises,
+  // so a memory domain that believes the request immediately can decode an
+  // address that has not arrived.
+  //
+  // One flop restores that guarantee -- the memory side sees the request half a
+  // CPU cycle later, by which time the payload is settled -- and still returns
+  // half the latency. Measured: S_DONE fell from 7.12 cycles per transaction to
+  // 1.14.
+  //
+  // This REQUIRES the two clocks to be declared related in Model2.sdc; they were
+  // in separate -asynchronous groups, which would leave these paths unchecked.
+  // R464: ONE FLOP AGAIN. R460 took the i960 to 30, which made this 3:5 and
+  // needed two; the CPU is back at 25 and the exact 2:1 with it, so general[3]
+  // is in the timed group again and one flop is sound. The 30 MHz version of
+  // this note is in the commit for R460 if the CPU clock ever moves.
+  //
+  // WHAT FOLLOWS IS WHY ONE FLOP IS ENOUGH AT 2:1.
+  //
+  // Everything above is true of 25/50. clk_i960 is 30 MHz now and clk_sys is
+  // still 50, which is 3:5 -- the edges realign every 50 ns and the closest a
+  // launch edge comes to a capture edge is 3.333 ns. Model2.sdc therefore puts
+  // general[3] in its own clock group, the paths here are CUT, and a single
+  // flop across a cut boundary is an unsynchronised crossing.
+  //
+  // WHAT THIS COSTS, AND WHY IT IS AFFORDABLE. The note above measured S_DONE
+  // at 7.12 cycles per transaction with two flops against 1.14 with one, and
+  // called protocol "essentially the whole cost of a memory access" with the
+  // data cache in front. That is a ratio on the accesses that REACH memory, not
+  // on CPU throughput, and reading it as the latter is what nearly kept this
+  // core at 25 MHz.
+  //
+  // Model 1 has the calibration, at m1_cdc_port: "The V60 can afford it:
+  // measured, 64-cycle memory latency costs it 1.8% (docs/m1-m4-plan.md, 'V60
+  // fetch'), and this bridge adds far less than that." Its CPU crosses at
+  // 29.47 against clk_sys 80 -- a 2.71 ratio, genuinely asynchronous, every
+  // cross-pair a false path in its timing report -- and that core went from 30
+  // to 60 fps when the CPU and 3D clocks went up. Six cycles here is far less
+  // than the 64 that cost 1.8%.
+  // R576: TWO FLOPS WHEN ASYNC (R460's form), for the i960 at 35.3 MHz against
+  // a 60 MHz core: the payload rule above still holds -- r_addr and friends are
+  // written with req_cpu and stay put until the four-phase handshake ends --
+  // and the second flop is what makes the request itself safe to sample.
+  logic [1:0] req_mem_s;
+  always_ff @(posedge clk_mem or negedge rst_n_mem) begin
+    if (!rst_n_mem) req_mem_s <= 2'b00;
+    else            req_mem_s <= {req_mem_s[0], req_cpu};
+  end
+  assign req_mem = ASYNC ? req_mem_s[1] : req_mem_s[0];
+
+  // --------------------------------------------------------------- decoding
+  //
+  // Regions are tested in the order model2.cpp declares them, and the ROM
+  // mirror is tested BEFORE the RAM it overlaps so a stray write cannot shadow
+  // it. Anything not listed is counted, not silently zero: an unmapped access
+  // is a fact about the port map and it should be visible.
+  typedef enum logic [2:0] {
+    T_SDRAM, T_TRAM, T_PAL, T_XLAT, T_IO, T_NONE
+  } tgt_e;
+
+  tgt_e        tgt;
+  logic [AW:1] sd_word;          // 16-bit word address for the low half
+  logic        is_rom;           // read-only: writes are dropped, as .rom().nopw()
+
+  // NEVER RETAIN A BUFFER-RAM LINE. Three reasons, each sufficient:
+  //
+  //   * the region has writers the cache cannot see -- the geo DMA and the
+  //     bi_ initialiser write it straight to SDRAM, so a retained line goes
+  //     stale with no invalidation. The DPRAM is kept out of the cache for
+  //     exactly this ("never cached... keeps the I/O board's side correct").
+  //   * the reference mirrors it (.mirror(0x60000)). The cache tags the CPU
+  //     address, so 0x900010 and 0x960010 are DIFFERENT lines naming the SAME
+  //     word -- a write through one alias invalidates only its own line, and
+  //     per-line invalidation can therefore never be coherent here, even with
+  //     the CPU as the only writer.
+  //   * the d-cache is this project's own addition, not the i960's. Excluding
+  //     a shared region is faithful by default.
+  //
+  // Implemented as FILL SUPPRESSION, not as a route down the plain read path:
+  // that path is dead code behind the cache, works in both simulations, and
+  // hung real hardware at the fourth boot-record read when DCACHE_EN=0 ran it
+  // (its second-half read is not burst-aligned, which the controller's port
+  // contract requires). The read still takes the proven aligned-burst route;
+  // the line is simply never written back into the cache, so every read
+  // misses and refetches. Slower, coherent, and one variable against the
+  // livelocked build.
+  // R724: THE ADDRESS A LINE READ IS AT. A line is two data-cache lines (8 B
+  // each); bit 3 picks the half being read (lhalf), and only bit 3 differs from
+  // r_addr. The region decode below still keys on r_addr, so lmode (which needs
+  // the target) and ra (which needs lmode) form no loop; only sd_word and the
+  // cache index take ra.
+  logic         lhalf;
+  wire          lmode = r_line && !r_we && DCACHE_EN && (tgt == T_SDRAM);
+  wire  [24:1]  ra    = {r_addr[24:4], lmode ? lhalf : r_addr[3], r_addr[2:1]};   // the bits sd_word and dc_idx read
+  logic nocache;
+  logic pal_mirror, xlat_mirror;   // R222: an SDRAM write that also lands on chip
+  // R264: this store owns ONE 16-bit word, not a dword's two. The texture
+  // sheets take the low half of each store and the luma table takes the low
+  // byte; writing a second word would land the store's upper half on the next
+  // texel, which is what the reference discards.
+  logic half_only;
+  logic buf_region;      // R266: this access names the display list
+  logic tex_region;      // R275: this access names a texture sheet
+
+  always_comb begin
+    tgt     = T_NONE;
+    sd_word = '0;
+    is_rom  = 1'b0;
+    nocache = 1'b0;
+    pal_mirror  = 1'b0;
+    xlat_mirror = 1'b0;
+    half_only   = 1'b0;
+    buf_region  = 1'b0;
+    tex_region  = 1'b0;
+    if (r_addr < 32'h0020_0000) begin                       // program ROM
+      tgt = T_SDRAM; is_rom = 1'b1;
+      if (prog_ext && !BOARD_2A && (r_addr[20:18] == 3'b001))   // R726: Virtua Cop, 0x40000-0x7FFFF
+        sd_word = base_progx + AW'(ra[17:1]);
+      else if (prog_ext && BOARD_2A && (r_addr[20:19] != 2'b00))   // R862: 2A, 0x80000-0x1FFFFF
+        sd_word = base_progx + AW'(ra[20:1]);                  // base_progx is the slot - 0x40000 words
+      else
+        sd_word = base_prog + AW'(ra[20:1]);
+    end else if (!BOARD_2A && r_addr >= 32'h0022_0000 && r_addr < 32'h0024_0000) begin
+      // model2o's ROM mirror of the program ROM's second 128 KB.
+      tgt = T_SDRAM; is_rom = 1'b1;
+      sd_word = base_prog + AW'(20'h10000) + AW'(ra[16:1]);
+    end else if (r_addr >= 32'h0020_0000 && r_addr < (BOARD_2A ? 32'h0024_0000
+                                                              : 32'h0022_0000)) begin
+      tgt = T_SDRAM;
+      sd_word = base_board + AW'(ra[17:1]);
+    end else if (r_addr >= 32'h0050_0000 && r_addr < 32'h0060_0000) begin
+      tgt = T_SDRAM;
+      sd_word = base_work + AW'(ra[19:1]);
+    end else if (r_addr >= 32'h0108_0000 && r_addr < 32'h0110_0000) begin
+      tgt = T_SDRAM;                                        // char RAM, 512 KB
+      sd_word = base_char + AW'(ra[18:1]);
+    // BISECTED: writes only. This region does TWO things when it is enabled --
+    // writes start landing where they used to vanish, and reads start
+    // returning real data where they used to return the T_IO default of 0.
+    // Enabling both at once breaks the machine and four theories have died on
+    // it. `r_we` in the condition lets WRITES land while READS still fall
+    // through to T_IO and read 0, exactly as before, which splits the change
+    // in half: if this boots, the fault is in what the reads return.
+    end else if (BUFFERRAM && (r_we || !BUFFERRAM_WRONLY)
+                 && r_addr >= 32'h0090_0000 && r_addr < 32'h0098_0000) begin
+      // 128 KB, and the mirror is free: [16:1] simply ignores the repeat.
+      tgt = T_SDRAM; buf_region = 1'b1;   // R266
+      nocache = BUFFER_NOCACHE;
+      sd_word = base_buffer + AW'(ra[16:1]);
+    end else if (r_addr >= 32'h0200_0000 && r_addr < 32'h0400_0000) begin
+      tgt = T_SDRAM; is_rom = 1'b1;                         // main_data
+      sd_word = base_data + AW'(ra[24:1]);
+    end else if (r_addr >= 32'h0600_0000 && r_addr < 32'h0700_0000) begin
+      tgt = T_SDRAM; is_rom = 1'b1;                         // the +0x1000000 alias
+      sd_word = base_data + AW'(24'h800000) + AW'(ra[23:1]);
+    end else if (r_addr >= 32'h0100_0000 && r_addr < 32'h0102_0000) begin
+      tgt = T_TRAM;                                         // tile RAM
+    end else if (r_addr >= 32'h0180_2000 && r_addr < 32'h0180_2800) begin
+      tgt = T_SDRAM; pal_mirror = 1'b1;                     // R222: 3D palette, mirrored
+      sd_word = base_pal3d + AW'(ra[10:1]);
+    end else if (r_addr >= 32'h0180_0000 && r_addr < 32'h0180_4000) begin
+      tgt = T_PAL;
+    end else if (r_addr >= 32'h1200_0000 && r_addr < 32'h1240_0000) begin
+      // R264: texture sheet 0, and its mirror at +0x200000. The reference's
+      // tex0_w takes `offset` as a DWORD index and stores data[15:0] at
+      // textureram[offset>>1], half offset&1 -- which as 16-bit words is
+      // simply word `offset`. So the CPU's dword index IS our word index.
+      // R278: [20:2], NOT [21:2]. The reference's map is
+      //     map(0x12000000, 0x121fffff) ... .mirror(0x200000)
+      // so the region is 2 MB -- 512 K dwords, which is bits [20:2] -- and bit
+      // 21 is the MIRROR, an address line the chip select ignores. Taking it
+      // as part of the index put every mirrored write half a megaword past the
+      // base: sheet 0's mirror landed on sheet 1, and sheet 1's mirror landed
+      // on the LUMA TABLE. Daytona uploads its textures THROUGH THE MIRROR --
+      // tb_m2_boot's histogram shows all 71,297 of its writes to 0x12xxxxxx
+      // arriving at the luma base and none at either sheet -- so every texture
+      // this core has ever been given went into the wrong memory.
+      tgt = T_SDRAM; half_only = 1'b1; tex_region = 1'b1;
+      sd_word = base_texs0 + AW'(ra[20:2]);
+    end else if (r_addr >= 32'h1240_0000 && r_addr < 32'h1280_0000) begin
+      tgt = T_SDRAM; half_only = 1'b1; tex_region = 1'b1;
+      sd_word = base_texs1 + AW'(ra[20:2]);   // R278: the mirror is bit 21
+    end else if (r_addr >= 32'h1280_0000 && r_addr < 32'h1282_0000) begin
+      // R264: the polygon luma table, 32 K BYTES -- the reference maps it
+      // umask32 0x000000ff, so one byte per dword. ONE BYTE PER 16-BIT WORD
+      // here rather than two packed: R82 measured that byte enables are lost
+      // between this bridge and the silicon, so a packed table would need the
+      // one mechanism this design knows it cannot trust.
+      tgt = T_SDRAM; half_only = 1'b1;
+      sd_word = base_luma + AW'(ra[16:2]);
+    end else if (r_addr >= 32'h0181_0000 && r_addr < 32'h0181_c000) begin
+      tgt = T_SDRAM; xlat_mirror = 1'b1;                    // R222: colorxlat, mirrored
+      sd_word = base_xlat3d + AW'(ra[15:1]);
+    end else if (r_addr >= 32'h0080_0000 && r_addr < 32'h0100_0000) begin
+      tgt = T_IO;                                           // geo, copro, video, irq
+    end else if (r_addr >= 32'h0102_0000 && r_addr < 32'h0108_0000) begin
+      tgt = T_IO;                                           // tile control registers
+    end else if (r_addr >= 32'h01a0_0000 && r_addr < 32'h0200_0000) begin
+      tgt = T_IO;                                           // comm, I/O, backup
+    end else if (r_addr >= 32'h1000_0000) begin
+      tgt = T_IO;                                           // renderer, framebuffer
+    end
+  end
+
+  // Tile RAM and the palette are 16 bits wide and the CPU addresses them by
+  // byte, so a 32-bit access is two words -- and the SECOND ONE IS AT THE NEXT
+  // ADDRESS. The first version drove `r_addr[15:1]` flat for both halves, so
+  // the high half wrote over the low one and a readback returned the same word
+  // twice: 0x00220022 for a value of 0x00110022.
+  //
+  // Combinational off `half`, and the data with it, because these are M10K with
+  // a registered read: the address has to be presented a cycle before the value
+  // is captured, which is what the S_IDLE -> S_LO -> S_HI walk below does.
+  // WHICH HALVES OF THE DWORD THIS ACCESS ACTUALLY OWNS.
+  //
+  // half_be: the word addressed by r_addr[15:1] -- the one written in S_IDLE.
+  // hi_be:   the word after it, which only a 32-bit aligned store reaches.
+  //
+  // The i960 replicates sub-word store data across the bus, which is why
+  // oc_din can keep taking r_wdata[15:0] for the first word regardless of
+  // r_addr[1]: a store to 0x01800002 with be=c was observed writing 9090
+  // correctly through that path. Only the ENABLES were wrong.
+  wire half_be = r_addr[1] ? (|r_be[3:2]) : (|r_be[1:0]);
+  wire hi_be   = ~r_addr[1] & (|r_be[3:2]);
+
+  // R937: `half` IS CLEARED WHEN AN ACCESS COMPLETES, NOT WHEN THE NEXT ONE
+  // STARTS. The low word of a read is presented in S_IDLE -- the cycle the
+  // request is taken -- and the M10K answers at the edge after it, which S_LO
+  // captures. Clearing `half` on that same edge, as S_IDLE does, is a cycle
+  // late: the array was handed r_addr[15:1] + 1 from the S_HI the last access
+  // ended in (every on-chip access, every write but an upper-half store).
+  // So an aligned halfword read of tile RAM or the palette returned the word
+  // after it and a 32-bit read came back halves swapped; a read at +2 landed
+  // right by accident. STCC's title toggles bit 15 of every tile with an
+  // ldos / xor / stos loop and drew each 8-pixel column twice. Writes never
+  // saw it: their enable is registered into S_LO, after `half` is 0.
+  // A READ fetches the whole dword -- {r_addr[15:2], 0} captured in S_LO into
+  // [15:0], then +1 into [31:16] in S_HI -- and the CPU takes the half it asked
+  // for by its own addr[1]. A write keeps r_addr[15:1]: an upper-half store
+  // writes its one word in S_LO.
+  assign oc_addr      = (r_we ? r_addr[15:1] : {r_addr[15:2], 1'b0}) + {14'd0, half};
+  assign oc_din       = half ? r_wdata[31:16] : r_wdata[15:0];
+  // THE COLOUR-TRANSLATION TABLE IS STRIDED, NOT PACKED.
+  //
+  // This was `r_addr[7:1]`, which keeps the low eight bits of the byte address
+  // and throws away everything that identifies the entry. model2.cpp reads it:
+  //
+  //   r = m_colorxlat[(0x0080 >> 1) + (((palcolor >> 0) & 0x1f) << 8)];
+  //   g = m_colorxlat[(0x4080 >> 1) + ...];
+  //   b = m_colorxlat[(0x8080 >> 1) + ...];
+  //
+  // so the entries this core keeps are at BYTE offsets 0x0080 + v*512 for red,
+  // 0x4080 + v*512 for green and 0x8080 + v*512 for blue, v = 0..31. The stride
+  // is 512 and the channel is bits 15:14. `r_addr[7:1]` sees neither: every one
+  // of the game's writes landed on the same few table entries, and the rest kept
+  // the pal5bit values the table powers up with.
+  //
+  // Only 96 of 24,576 entries are ever read -- 32 per channel -- which is why
+  // this is a 96-byte table and not 48 KB (study R27). That economy is exactly
+  // what makes the indexing load-bearing.
+  //
+  // Found from the board: the CPU builds a correct palette (4,036 of 4,096 words
+  // matching MAME) and a correct tilemap (32,340 of 32,768), and the screen was
+  // still white.
+  assign oc_xlat_addr = {r_addr[15:14], r_addr[13:9]};
+
+  // ---------------------------------------------------------- the sequencer
+  //
+  // Two halves for anything 16 bits wide, one for I/O. `half` names which is in
+  // flight; the low half lands in bits 15:0 and the high half in 31:16.
+  // S_LO_W and S_HI_W wait for the controller's ACK TO FALL before the next
+  // request goes out. m2_sdram holds p_ack for ACK_HOLD cycles -- 2, by its own
+  // parameter, "so requesters on a slower synchronous clock see exactly one
+  // rising edge" -- and this bridge runs on the SAME clock as the controller.
+  // Issuing the second half while the first half's ack is still asserted means
+  // sampling it immediately and capturing the FIRST word again, so a 32-bit read
+  // returns its low half in both halves.
+  //
+  // On hardware that made the i960 read its boot IP as 0x00600860 where the ROM
+  // holds 0x00000860 -- the low half right, the high half not.
+  // S_DCK joins them, so the encoding needs a fourth bit.
+  typedef enum logic [3:0] { S_IDLE, S_LO, S_LO_W, S_HI, S_HI_W, S_RDB, S_IOW, S_DONE,
+                             S_DCK, S_RMW, S_RMW_W,
+                             S_DCN } st_e;   // R724: a line read's second half, addressed
+
+  // READ-MODIFY-WRITE FOR SUB-WORD WRITES, because byte enables do not reach
+  // the memory on this board.
+  //
+  // Measured: the CPU issues a byte store (data 0x27272727, be=0001 -- correct
+  // i960 behaviour, it replicates the byte and relies on the enables), the
+  // bridge forwards be=01 (verified on hardware), and every lane still lands.
+  // The x2 adapter passes be through combinationally, the controller captures
+  // it on the request edge and drives sd_dqm = ~be, the pins are assigned and
+  // constrained, and simulation gets all four lanes right against the device
+  // model. Bypassing the data cache changes nothing, so it is not that either.
+  //
+  // Every hop verifies and the result is still wrong, which leaves the SDRAM
+  // module: DQM tied low is common on these boards, and it would make every
+  // byte write land in all four lanes exactly as observed -- invisible to every
+  // test we own, because they all test the FPGA.
+  //
+  // So stop depending on it. A partial write READS the word, merges the enabled
+  // bytes here, and writes back FULL WIDTH. No mask reaches the device.
+  logic [31:0] rmw_dat;
+  logic        rmw_done;
+  wire         needs_rmw = r_we && (r_be != 4'b1111);
+  st_e  st;
+  logic half;
+
+  // ----------------------------------------------------------- DATA CACHE
+  //
+  // MEASURED BEFORE IT WAS BUILT. An 813,751-address read trace from the boot
+  // harness, modelled offline exactly as the instruction cache was:
+  //
+  //     size   ways   hit%     M10K
+  //     2KB      1    97.86     2.1
+  //    16KB      1    97.89    16.4
+  //
+  // 2 KB takes the whole prize; sixteen buys 0.03 points. The working set is
+  // 16,910 distinct lines and heavily reused, which is why so little goes so
+  // far. Reads are 83.5% of the CPU's memory traffic and carry ~19.7 of the
+  // 32.45 CPI, so removing 97.9% of them is the largest lever this core has.
+  //
+  // EIGHT-BYTE LINES, because that is exactly one burst. Every port returns
+  // four 16-bit words in a 64-bit p_dout, so a line fill costs ONE transaction
+  // and discards nothing -- where today a 32-bit read uses half of what it
+  // fetches and throws the rest away.
+  //
+  // TAGS IN M10K, READ REGISTERED, and this is the i960_icache lesson paid
+  // forward: that file pins its tags to logic because `hit` compares them
+  // combinationally, which cost 736 bits of flip-flops there and would cost
+  // 5,632 here. A registered tag costs ONE cycle in S_DCK, against the ~19 a
+  // miss costs, so the trade is not close.
+  //
+  // WRITE-THROUGH, INVALIDATE, NO ALLOCATE. Writes already go to SDRAM and
+  // simply drop the line they land on. Every T_SDRAM region is written by the
+  // CPU alone once it is running -- work RAM, char RAM and backup are CPU-only,
+  // ROM is read-only, and the ROM loader finishes before the CPU starts -- so
+  // there is no other master to be coherent with. The DPRAM is T_IO and is
+  // never cached, which is what keeps the I/O board's side correct.
+  // 2 KB WAS NOT ENOUGH, MEASURED ON THE BOARD. The hit rate on the code the
+  // first three minutes run is 55 per cent -- two of every three accesses miss,
+  // 651,000 SDRAM round trips a second at one million instructions a second, so
+  // roughly two thirds of an instruction is a memory stall. That IS the 24
+  // cycles per instruction; nothing else needs to explain it.
+  //
+  // An earlier session measured this same cache at 99.57% on the boot path, so
+  // it is not the cache being wrong, it is this working set not fitting: 55% on
+  // a DIRECT-MAPPED cache is the signature of conflict thrashing rather than
+  // capacity alone.
+  //
+  // 2048 lines x 8 B = 16 KB, eight times the size, which is affordable now
+  // that R96 and R97 returned 95 M10K blocks. The tag narrows by three bits as
+  // the index widens, so the tag array barely grows.
+  // R728: 1024 lines, 8 KB -- the other 8 blocks went to the CPU side's code
+  // cache, which now holds what most of the code lines here were for.
+  localparam int unsigned DC_LINES = CC_EN ? 1024 : 2048; // x 8 B
+  localparam int unsigned DC_IDXW  = $clog2(DC_LINES);    // 10 (11)
+  localparam int unsigned DC_TAGW  = 32 - DC_IDXW - 3;    // 19 (18)
+
+  (* ramstyle = "M10K" *) logic [63:0]          dc_data [DC_LINES];
+  (* ramstyle = "M10K" *) logic [DC_TAGW:0]     dc_tag  [DC_LINES];   // {valid,tag}
+
+  logic [63:0]        dc_q;
+  logic [DC_TAGW:0]   dc_tq;
+  logic [DC_IDXW-1:0] dc_a;
+  logic               dc_dwe, dc_twe;
+  logic [63:0]        dc_din;
+  logic [DC_TAGW:0]   dc_tin;
+
+  wire [DC_IDXW-1:0] dc_idx  = ra[DC_IDXW+2:3];   // R724: ra -- a line read's second half
+  wire [DC_TAGW-1:0] dc_tagv = r_addr[31:DC_IDXW+3];
+  logic [DC_TAGW-1:0] dc_tag_r;
+  logic               dc_sweeping;
+  logic [DC_IDXW-1:0] dc_sweep;
+  logic               dc_inval;     // a write is dropping this line
+
+  always_ff @(posedge clk_mem) begin
+    dc_q  <= dc_data[dc_a];
+    dc_tq <= dc_tag [dc_a];
+    if (dc_dwe) dc_data[dc_a] <= dc_din;
+    if (dc_twe) dc_tag [dc_a] <= dc_tin;
+  end
+
+  wire dc_hit = dc_tq[DC_TAGW] && (dc_tq[DC_TAGW-1:0] == dc_tag_r);
+
+  // The array port, one owner per cycle. The reset sweep outranks everything --
+  // nothing may be served from a cache whose valid bits are still uninitialised
+  // -- then a fill, then a write's invalidate, and otherwise the lookup.
+  always_comb begin
+    dc_a   = dc_idx;
+    dc_dwe = 1'b0;
+    dc_twe = 1'b0;
+    dc_din = sd_dout[63:0];
+    dc_tin = {1'b1, dc_tag_r};
+    if (dc_sweeping) begin
+      dc_a   = dc_sweep;
+      dc_twe = 1'b1;
+      dc_tin = '0;
+    end else if (st == S_RDB && sd_ack) begin
+      dc_dwe = !nocache;                   // fill: ROM and RAM alike -- but a
+      dc_twe = !nocache;                   // nocache region is never retained
+    end else if (dc_inval) begin
+      dc_twe = 1'b1;
+      dc_tin = '0;
+    end
+  end
+
+  always_ff @(posedge clk_mem or negedge rst_n_mem) begin
+    if (!rst_n_mem) begin
+      st <= S_IDLE; ack_mem <= 1'b0; half <= 1'b0; ack_mem_d <= 1'b0; req_seen <= 1'b0;   // R729
+      sd_req <= 1'b0; sd_we <= 1'b0; sd_addr <= '0; sd_din <= 16'd0; sd_be <= 2'b11;
+      oc_tram_we <= 1'b0; oc_pal_we <= 1'b0; oc_xlat_we <= 1'b0; col_inval <= 1'b0; buf_inval <= 1'b0; tex_inval <= 1'b0;
+      io_sel <= 1'b0; io_we <= 1'b0;
+      r_rdata <= 32'd0;
+      dbg_cpu_reads <= 32'd0; dbg_cpu_writes <= 32'd0; dbg_unmapped <= 32'd0;
+      // Nothing may be served from valid bits that were never initialised.
+      dc_sweeping <= 1'b1; dc_sweep <= '0; dc_inval <= 1'b0; dc_tag_r <= '0;
+      rmw_dat <= 32'd0; rmw_done <= 1'b0;
+      lhalf <= 1'b0; l_ok <= 1'b0; l_data <= '0;   // R724
+      dbg_dc_hits <= 32'd0; dbg_dc_miss <= 32'd0;
+      dbg_last_addr <= 32'd0; dbg_last_dout <= 32'd0;
+      dbg_probe6 <= 32'hEEEE_EEEE; dbg_probe2 <= 32'hEEEE_EEEE;
+      dbg_tram_wr <= 32'd0; dbg_pal_wr <= 32'd0;
+    end else begin
+      oc_tram_we <= 1'b0; oc_pal_we <= 1'b0; oc_xlat_we <= 1'b0; col_inval <= 1'b0; buf_inval <= 1'b0; tex_inval <= 1'b0;
+      io_sel     <= 1'b0;
+      // R698: AND AGAIN WHEN A COLOUR WRITE HAS LANDED. The pulse at dispatch
+      // comes before the SDRAM holds the new word -- and since R702 the
+      // geometry's port outranks this one, so an engine read can overtake the
+      // queued write and take the old colour. ack_mem rises on the completion
+      // (a write's SDRAM acknowledge has been seen), and r_* stand until the
+      // CPU side drops its request.
+      ack_mem_d <= ack_mem;
+      if ((ack_mem != ack_mem_d) && r_we && (pal_mirror || xlat_mirror)) col_inval <= 1'b1;   // R729: a toggle
+      // R749: AND THE DISPLAY LIST AND THE TEXTURES THE SAME WAY. buf_inval and
+      // tex_inval fired only at dispatch, so the walker's pair cache (port 4,
+      // which outranks this port since R702) could re-read the OLD word -- a
+      // command's placeholder count -- while the CPU's patch was still queued,
+      // and keep it until the next list write: a zero count, the light table
+      // filled with 0/0 (R747's black 3D, still there with R747 on s833). R698
+      // closed exactly this for colours and left the walker's cache out.
+      if ((ack_mem != ack_mem_d) && r_we && buf_region) buf_inval <= 1'b1;
+      if ((ack_mem != ack_mem_d) && r_we && tex_region) tex_inval <= 1'b1;
+
+      // The cache's own housekeeping, before any state runs.
+      dc_inval <= 1'b0;
+      if (dc_sweeping) begin
+        dc_sweep <= dc_sweep + 1'b1;
+        if (dc_sweep == DC_IDXW'(DC_LINES - 1)) dc_sweeping <= 1'b0;
+      end
+
+      case (st)
+        // !sd_ack as well as req_mem: the previous access's ack may still be
+        // held when the next request arrives, and issuing into it has exactly
+        // the same effect as issuing into it below.
+        // R729: a NEW request is a toggle not yet taken; rmw_done re-dispatches
+        // the same one as its write half (S_RMW_W returns here with it set).
+        S_IDLE: if ((req_mem != req_seen || rmw_done) && !sd_ack && !dc_sweeping
+                    && !(r_we && buf_region && buf_wr_stall)) begin   // R697
+          req_seen <= req_mem;
+          if (r_we) dbg_cpu_writes <= dbg_cpu_writes + 32'd1;
+          else      dbg_cpu_reads  <= dbg_cpu_reads  + 32'd1;
+          // R937: an on-chip READ moves to the high word on this edge. The low
+          // word is being presented now (`half` was cleared at the last
+          // completion) and S_LO captures it; S_LO must present the high one
+          // for S_HI to capture. A write keeps the low word through S_LO --
+          // its enable lands there -- and moves to the high word in S_LO.
+          half <= !r_we && ((tgt == T_TRAM) || (tgt == T_PAL));
+          l_ok <= 1'b0;   // R724
+          case (tgt)
+            T_SDRAM: begin
+              if (r_we && is_rom) begin
+                ack_mem <= ~ack_mem; rmw_done <= 1'b0; lhalf <= 1'b0; half <= 1'b0;   // R729; R937 st <= S_IDLE;   // R729: complete    // .rom().nopw()
+              end else if (!r_we && DCACHE_EN) begin
+                // ASK THE CACHE FIRST. The arrays were addressed with dc_idx
+                // combinationally this cycle, so S_DCK can compare next cycle.
+                // 97.9% of reads end there and never reach the memory at all.
+                dc_tag_r <= dc_tagv;
+                st       <= S_DCK;
+              end else if (!r_we) begin
+                // Cache bypassed: the pre-cache path, byte for byte.
+                sd_addr <= sd_word;
+                sd_we   <= 1'b0;
+                sd_be   <= 2'b11;
+                sd_req  <= 1'b1;
+                st      <= S_RDB;
+              end else if (needs_rmw && !rmw_done) begin
+                // R222: the on-chip half of a mirrored write, once, here.
+                oc_pal_we   <= pal_mirror && half_be;
+                col_inval   <= pal_mirror || xlat_mirror;
+                oc_xlat_din <= r_wdata[7:0];
+                oc_xlat_we  <= xlat_mirror && (r_addr[8:0] == 9'h080);
+                dc_inval <= 1'b1;
+                sd_addr  <= {sd_word[AW:3], 2'b00};
+                sd_we    <= 1'b0;
+                sd_be    <= 2'b11;
+                sd_req   <= 1'b1;
+                st       <= S_RMW;
+              end else begin
+                // WRITE-THROUGH, INVALIDATE, NO ALLOCATE. The write reaches
+                // memory exactly as before and drops whatever line it lands on.
+                // That is the whole coherency story for a cache no other master
+                // can get behind: work RAM, char RAM and backup are CPU-only,
+                // ROM is read-only, and the ROM loader finishes before the CPU
+                // starts. The DPRAM is T_IO and is never cached, which is what
+                // keeps the I/O board's side correct.
+                dc_inval <= 1'b1;
+                buf_inval <= buf_region;   // R266
+                tex_inval <= tex_region;   // R275
+                // R222: the on-chip half of a mirrored write -- the palette
+                // RAM's low word, or the tile layer's 96-entry tap -- unless
+                // the read-modify-write pass already did it.
+                oc_pal_we   <= r_we && !rmw_done && pal_mirror && half_be;
+                col_inval   <= r_we && !rmw_done && (pal_mirror || xlat_mirror);
+                oc_xlat_din <= r_wdata[7:0];
+                oc_xlat_we  <= r_we && !rmw_done && xlat_mirror && (r_addr[8:0] == 9'h080);
+                sd_addr <= sd_word;
+                sd_we   <= r_we;
+                // THE HALF THAT BELONGS AT THIS WORD, NOT ALWAYS THE LOW ONE.
+                //
+                // SDRAM word r_addr[18:1] holds bytes r_addr and r_addr+1, and
+                // those are the CPU dword's bytes r_addr[1:0] and r_addr[1:0]+1.
+                // For an ALIGNED access that is the low half; for one with
+                // r_addr[1] set it is the high half.
+                //
+                // This always sent r_wdata[15:0] with r_be[1:0], so an unaligned
+                // access sent the wrong half AND the byte enables that go with
+                // it -- 2'b00 -- which drops the write entirely. The i960
+                // splits an unaligned 32-bit store into two transactions, and
+                // one of the two was silently lost every time.
+                //
+                // Aligned accesses are unaffected, which is why the boot's own
+                // 128 KB copy matched 65,536 of 65,536 words while character
+                // data came out half written.
+                sd_din  <= rmw_done ? (r_addr[1] ? rmw_dat[31:16] : rmw_dat[15:0])
+                                    : (r_addr[1] ? r_wdata[31:16] : r_wdata[15:0]);
+                sd_be   <= rmw_done ? 2'b11
+                                    : (r_addr[1] ? r_be[3:2] : r_be[1:0]);
+                sd_req  <= 1'b1;
+                st      <= S_LO;
+              end
+            end
+            T_TRAM, T_PAL: begin
+              // `half` is already 0 here, so oc_addr and oc_din name the low
+              // word this cycle.
+              //
+              // GATED ON THE BYTE ENABLES, WHICH THIS DID NOT DO (study R56).
+              // Both halves were written for EVERY store, which is right for a
+              // 32-bit one and destroys the neighbouring halfword for a 16-bit
+              // one. Daytona's `stis g0,0x1800000(g4)` at 0x2784 is a HALFWORD
+              // store: MAME clears palette entry 0 and leaves entry 1 holding
+              // ffff, and we cleared both -- which is precisely why its test
+              // menu drew green values and no white labels.
+              //
+              // `half_be` is the enable for the word this state writes. When
+              // r_addr[1] is set the access names the dword's UPPER half, and
+              // oc_addr is already r_addr[15:1], so the relevant enables are
+              // r_be[3:2] -- observed as be=c on stores to 0x01800002.
+              oc_tram_we <= r_we && (tgt == T_TRAM) && half_be;
+              oc_pal_we  <= r_we && (tgt == T_PAL)  && half_be;
+              if (r_we && (tgt == T_TRAM)) dbg_tram_wr <= dbg_tram_wr + 32'd1;
+              if (r_we && (tgt == T_PAL))  dbg_pal_wr  <= dbg_pal_wr  + 32'd1;
+              st         <= S_LO;
+            end
+            // T_XLAT is decoded as a mirrored T_SDRAM write since R222; the
+            // tile layer's 96-entry tap (r_addr[8:0] == 0x080: every entry in
+            // the 48 KB region shares those bits exactly when it is one of the
+            // 96 the tiles read) is taken beside the SDRAM write above.
+            // ONE CYCLE BETWEEN ASSERTING io_sel AND SAMPLING io_rdata.
+            //
+            // This used to do both on the same edge, which captures whatever
+            // the I/O side was presenting BEFORE the address it is being asked
+            // about had been clocked into it. That is correct for a
+            // combinational peripheral and one cycle early for a registered
+            // one, and m2_ioboard and m2_backup are both registered -- they
+            // have to be, because an asynchronously read array is not an MLAB
+            // on this part, it is flip-flops and 7,899 ALM.
+            //
+            // R34 IS WHY IT BITES. The i960 holds bus_req across a run of
+            // accesses and moves the address on the acknowledge, so on
+            // back-to-back accesses r_addr changes and this state is entered
+            // immediately, with the peripheral's registered output still
+            // showing the PREVIOUS address.
+            //
+            // On hardware that read as a boot stuck in a poll whose value was
+            // correct: the I/O board returned 00400000 for 0x01c00042 -- its
+            // own debug tap said so -- and the i960 was handed 00000000.
+            // Overlay rows 14 and 17 both reported healthy because both are on
+            // the far side of this sample.
+            T_IO: begin
+              io_sel <= 1'b1;
+              io_we  <= r_we;
+              st     <= S_IOW;
+            end
+            default: begin
+              dbg_unmapped <= dbg_unmapped + 32'd1;
+              r_rdata      <= 32'd0;
+              ack_mem      <= ~ack_mem; rmw_done <= 1'b0; lhalf <= 1'b0; half <= 1'b0;   // R729; R937
+              st           <= S_IDLE;   // R729: complete
+            end
+          endcase
+        end
+
+        // The registered I/O read, one cycle after the select. io_sel has
+        // already fallen by here -- it is cleared at the top of this block --
+        // which is right: a write lands on the cycle it is asserted, and a read
+        // only needs the address, which r_addr holds for the whole transaction.
+        S_IOW: begin
+          if (io_stall) begin
+            // Hold the access. io_sel is cleared at the top of this block every
+            // cycle, so re-assert it: the target must keep seeing a live select
+            // or it cannot tell when it becomes able to accept.
+            io_sel <= 1'b1;
+            io_we  <= r_we;
+          end else begin
+            r_rdata <= io_rdata;
+            ack_mem <= ~ack_mem; rmw_done <= 1'b0; lhalf <= 1'b0; half <= 1'b0;   // R729; R937
+            st      <= S_IDLE;   // R729: complete
+          end
+        end
+
+        // SDRAM low half, then high. The on-chip arrays answer in one cycle and
+        // reuse the same two states, which is why S_LO tests `tgt`.
+        S_LO: begin
+          if (tgt == T_SDRAM) begin
+            if (sd_ack) begin
+              sd_req <= 1'b0;
+              // Read back into the half this word belongs to, for the same
+              // reason the write picks a half: the CPU expects a byte at dword
+              // position r_addr[1:0], not always at position 0.
+              if (!r_we) begin
+                if (r_addr[1]) r_rdata[31:16] <= sd_dout[15:0];
+                else           r_rdata[15:0]  <= sd_dout[15:0];
+              end
+              dbg_last_addr <= {7'd0, sd_addr};
+              dbg_last_dout <= {16'd0, sd_dout[15:0]};
+              st <= S_LO_W;              // let the held ack fall first
+            end
+          end else begin
+            // Registered read: the low word was addressed in S_IDLE and is
+            // valid now. Move to the high word and assert its write here, so
+            // the address and the write enable arrive together.
+            r_rdata[15:0] <= (tgt == T_TRAM) ? oc_tram_q : oc_pal_q;
+            half          <= 1'b1;
+            // The SECOND halfword exists only for a full 32-bit aligned store.
+            // A halfword store has already written everything it owns, and
+            // writing here is what corrupted the entry next door.
+            oc_tram_we    <= r_we && (tgt == T_TRAM) && hi_be;
+            oc_pal_we     <= r_we && (tgt == T_PAL)  && hi_be;
+            st            <= S_HI;
+          end
+        end
+
+        // Ack has fallen: the high half is safe to issue.
+        S_LO_W: if (!sd_ack) begin
+          // NEVER ISSUE A WRITE THAT RELIES ON THE BYTE MASK TO DO NOTHING.
+          //
+          // The second word holds bytes r_addr+2 and r_addr+3. When r_addr[1]
+          // is set those belong to the NEXT dword and are not part of this
+          // transaction at all. This used to send them anyway as a write with
+          // sd_be = 2'b00 and zero data, trusting DQM to mask it. R82 measured
+          // on the board that the byte enables are LOST between source and
+          // silicon -- a byte store landed in all four lanes -- and this dummy
+          // write is the same fault with worse consequences: it lands 0x0000
+          // on the low half of the dword after every upper-half halfword
+          // store. Daytona's per-frame `stos g2, 6(g9)` at 0x6FA0 into the
+          // player car's task descriptor put that zero on the descriptor's
+          // SIZE field at +8, the task walker's `addi r7,g13,g13` then added
+          // nothing, and the walk spun on entry 13 of 140 for the rest of its
+          // count: every task above it -- car placement, the 0x22xxxx tasks,
+          // the 3D task at entry 140 -- was never called. Measured on
+          // build/e140 (entry 140 read 0x00000000, loaded twice in 9,000
+          // frames) and build/walk (last descriptor 0x504E00 in 920 of 923
+          // samples). Both simulations honour the mask and never showed it.
+          //
+          // So an upper-half write is complete after its one real word. Reads
+          // are unchanged: the cache-bypass read path still fetches both.
+          if (r_we && (r_addr[1] || half_only)) begin
+            ack_mem <= ~ack_mem; rmw_done <= 1'b0; lhalf <= 1'b0; half <= 1'b0;   // R729; R937
+            st      <= S_IDLE;   // R729: complete
+          end else begin
+            half    <= 1'b1;
+            oc_pal_we <= r_we && pal_mirror && hi_be;      // R222: the palette RAM's high word
+            sd_addr <= sd_word + AW'(1);
+            sd_din  <= r_addr[1] ? 16'd0
+                       : (rmw_done ? rmw_dat[31:16] : r_wdata[31:16]);
+            sd_be   <= r_addr[1] ? 2'b00 : (rmw_done ? 2'b11 : r_be[3:2]);
+            sd_req  <= 1'b1;
+            st      <= S_HI;
+          end
+        end
+
+        S_HI: begin
+          if (tgt == T_SDRAM) begin
+            if (sd_ack) begin
+              sd_req <= 1'b0;
+              if (!r_we && !r_addr[1]) r_rdata[31:16] <= sd_dout[15:0];
+              st <= S_HI_W;
+            end
+          end else begin
+            r_rdata[31:16] <= (tgt == T_TRAM) ? oc_tram_q : oc_pal_q;
+            ack_mem        <= ~ack_mem; rmw_done <= 1'b0; lhalf <= 1'b0; half <= 1'b0;   // R729; R937
+            st             <= S_IDLE;   // R729: complete
+          end
+        end
+
+        // THE LOOKUP. One cycle, because the tags are in M10K and read
+        // registered -- see the note on the storage above for why that trade is
+        // not close.
+        S_DCK: begin
+          if (dc_hit && lmode && !lhalf) begin
+            // R724: the line's first half; now the second
+            l_data[63:0] <= dc_q;
+            lhalf        <= 1'b1;
+            dbg_dc_hits  <= dbg_dc_hits + 32'd1;
+            st           <= S_DCN;
+          end else if (dc_hit) begin
+            r_rdata <= r_addr[2] ? dc_q[63:32] : dc_q[31:0];
+            if (lmode) begin l_data[127:64] <= dc_q; l_ok <= 1'b1; end   // R724
+            ack_mem <= ~ack_mem; rmw_done <= 1'b0; lhalf <= 1'b0; half <= 1'b0;   // R729; R937
+            dbg_dc_hits <= dbg_dc_hits + 32'd1;
+            st      <= S_IDLE;   // R729: complete
+          end else begin
+            // LINE-ALIGNED, so one four-word burst fills the whole line and
+            // nothing is discarded. It also restores natural dword alignment:
+            // the burst used to start at the requested HALFWORD, which is why
+            // the fixup below had to exist.
+            // sd_word is [AW:1], so the line's low two WORD bits are [2:1].
+            sd_addr <= {sd_word[AW:3], 2'b00};
+            sd_we   <= 1'b0;
+            sd_be   <= 2'b11;
+            sd_req  <= 1'b1;
+            dbg_dc_miss <= dbg_dc_miss + 32'd1;
+            st      <= S_RDB;
+          end
+        end
+
+        // The read half of a read-modify-write. WAIT FOR THE ACK TO FALL
+        // before re-dispatching: returning straight to S_IDLE walks into the
+        // held-acknowledge hazard S_LO_W and S_HI_W exist to avoid, which is
+        // R32's wrong boot vector.
+        S_RMW: if (sd_ack) begin
+          sd_req <= 1'b0;
+          rmw_dat[7:0]   <= r_be[0] ? r_wdata[7:0]
+                            : (r_addr[2] ? sd_dout[39:32] : sd_dout[7:0]);
+          rmw_dat[15:8]  <= r_be[1] ? r_wdata[15:8]
+                            : (r_addr[2] ? sd_dout[47:40] : sd_dout[15:8]);
+          rmw_dat[23:16] <= r_be[2] ? r_wdata[23:16]
+                            : (r_addr[2] ? sd_dout[55:48] : sd_dout[23:16]);
+          rmw_dat[31:24] <= r_be[3] ? r_wdata[31:24]
+                            : (r_addr[2] ? sd_dout[63:56] : sd_dout[31:24]);
+          rmw_done <= 1'b1;
+          st       <= S_RMW_W;
+        end
+
+        // The ack has fallen; now the write may be issued.
+        S_RMW_W: if (!sd_ack) st <= S_IDLE;
+
+        // A burst read: both halves arrive together in p_dout[31:0].
+        S_RDB: if (sd_ack) begin
+          sd_req        <= 1'b0;
+          // THE BURST STARTS AT THE REQUESTED WORD, WHICH IS NOT ALWAYS THE
+          // DWORD'S LOW HALF.
+          //
+          // sd_addr is sd_word = ra[..:1], so sd_dout[15:0] holds the bytes
+          // at r_addr itself. For an aligned access those are the dword's bytes
+          // 0 and 1 and this is right. When r_addr[1] is set they are bytes 2
+          // and 3, and the i960 looks for them in the HIGH half -- the LSU's
+          // `rd_half = cur_addr[1] ? bus_rdata[31:16] : bus_rdata[15:0]`.
+          //
+          // Taking sd_dout[31:0] unconditionally handed it the two words
+          // starting at r_addr with the halves the wrong way round, so every
+          // unaligned halfword read returned its NEIGHBOUR. The boot's
+          // character copy is a halfword loop -- ldos/stos with both pointers
+          // advancing by 2 -- so every other load was wrong: 52,375 of 140,864
+          // in a single boot, every one of them with be=c.
+          //
+          // Nothing caught it because every read in the suite was full-width
+          // and dword-aligned, and because ALL SDRAM reads come through here --
+          // S_LO and S_HI are the write path. An earlier attempt at this fix
+          // was made in S_LO, where reads never go.
+          // THE BURST IS NOW LINE-ALIGNED, so the halfword fixup this comment
+          // describes is GONE: sd_dout holds the whole eight-byte line in
+          // natural order, and the dword the CPU asked for is picked by
+          // r_addr[2]. The LSU still selects its halfword with cur_addr[1],
+          // which is what it expects to do.
+          r_rdata       <= DCACHE_EN ? (r_addr[2] ? sd_dout[63:32] : sd_dout[31:0])
+                                     : (r_addr[1] ? {sd_dout[15:0], 16'd0}
+                                                  : sd_dout[31:0]);
+          if (lmode) begin   // R724: this half of the line
+            if (lhalf) l_data[127:64] <= sd_dout[63:0];
+            else       l_data[63:0]   <= sd_dout[63:0];
+          end
+          dbg_last_addr <= {7'd0, sd_addr};
+          dbg_last_dout <= sd_dout[31:0];
+          // EEEEEEEE means the address was never read at all, which is a
+          // different fault from reading it and getting zero.
+          if (sd_addr == AW'(6)) dbg_probe6 <= sd_dout[31:0];
+          if (sd_addr == AW'(2)) dbg_probe2 <= sd_dout[31:0];
+          st            <= S_HI_W;      // still let the ack fall before answering
+        end
+
+        // Both halves are in. Wait for the second ack to fall before answering,
+        // so the next access cannot start into a held ack either.
+        //
+        // DEFENSIVE, and honestly labelled: unlike S_LO_W, this wait and the
+        // !sd_ack guard in S_IDLE are NOT proven necessary by the testbench --
+        // removing either still passes. They are kept because the next access
+        // is separated from this one only by the CPU-domain crossing, whose
+        // length is a clock ratio rather than a guarantee, and this is the
+        // exact hazard that put a wrong boot vector on the board.
+        S_HI_W: if (!sd_ack) begin
+          if (lmode && !lhalf) begin
+            lhalf <= 1'b1;          // R724: the line's second half
+            st    <= S_DCN;
+          end else begin
+            if (lmode) l_ok <= 1'b1;   // R724: both halves are in
+            ack_mem <= ~ack_mem; rmw_done <= 1'b0; lhalf <= 1'b0; half <= 1'b0;   // R729; R937
+            st      <= S_IDLE;   // R729: complete
+          end
+        end
+
+        // R724: the second half's address (lhalf now 1) is on the cache's port
+        // this cycle, so its tag and data are registered for S_DCK next cycle --
+        // exactly what S_IDLE does for a first lookup.
+        S_DCN: begin
+          dc_tag_r <= dc_tagv;
+          st       <= S_DCK;
+        end
+
+        // Hold ack until the requester has seen it and dropped req. Without
+        // this the crossing can fire twice for one access, which is the
+        // req-versus-req-and-ack fault named at the top.
+        // R729: unreachable -- a completion toggles ack_mem and returns to
+        // S_IDLE directly. Kept as a state so a glitch into it recovers.
+        S_DONE: st <= S_IDLE;
+
+        // Six named states in a three-bit type leaves two unreachable
+        // encodings. Naming them costs nothing and means a glitch into one is
+        // recoverable rather than a permanent stall.
+        default: st <= S_IDLE;
+      endcase
+    end
+  end
+
+  // r_we/r_addr are the LATCHED request, so this is registered by construction
+  // rather than a tap on a live bus.
+  // R647: THROUGH BOTH HALVES, NOT THE LOW WORD ONLY. A 32-bit store is two
+  // SDRAM writes into ONE four-word glyph-cache line. Invalidating only while
+  // the low word was written left a window: the tile fetch could refill the
+  // line after the low word and before the high one, and cache the OLD high
+  // half -- which nothing invalidated again, so half of a glyph row stayed
+  // from the previous character until the game rewrote it (the test screen's
+  // N drawn as H, I without its serifs). Whether the refill fell in the window
+  // was timing, so it came and went with the build: s347 clean, s351 on not.
+  assign char_wr = r_we && (r_addr >= 32'h0108_0000) && (r_addr < 32'h0110_0000)
+                   && (st == S_LO || st == S_LO_W || st == S_HI || st == S_HI_W);
+  assign char_wr_addr = r_addr[18:1];
+
+  assign dbg_mstate = {2'd0, sd_ack, ack_mem, (req_mem != req_seen), st[2:0]};   // R729: pending, not the toggle
+  assign dbg_sample = {(req_mem != req_seen), 3'(tgt), r_we, 4'(st), r_addr[23:16]};   // R721; R729: pending
+
+  assign io_addr  = r_addr;
+  assign io_wdata = r_wdata;
+  assign io_be    = r_be;
+
+endmodule

@@ -1,0 +1,361 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Sega Model 2 core for MiSTer FPGA
+//
+// PORTED FROM THE MODEL 1 CORE, m1_geo_project.sv @ 78481c420327, incremental branch.
+// Same author, same licence, renamed only. See THIRD_PARTY.md and study R170:
+// the geometry ARITHMETIC transfers between the boards, the display-list
+// grammar does not.
+//
+// Copyright (C) 2026 alphanu1
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the Free
+// Software Foundation, either version 3 of the License, or (at your option)
+// any later version. See LICENSE for the full text.
+//
+// The geometry stage's projection: a transformed point to a pixel.
+//
+// Behavioural contract is MAME's view_t::project_point (model1_v.cpp:79), and
+// push_object's guard around it (:911):
+//
+//     if (z > 0) { xx = x/z;  yy = y/z;
+//                  s.x = xc + (xx*zoomx + viewx);
+//                  s.y = yc - (yy*zoomy + viewy); }
+//     else       { s.x = s.y = 0; }
+//
+// The z <= 0 case is not a clip - it is a point BEHIND the eye given the
+// coordinates (0,0), which the frustum clipper upstream is expected to have
+// dealt with. Reproduced rather than improved: a point behind the eye that
+// reaches here lands at the top-left corner in MAME too, and quads built from it
+// are what the viewport clip then throws away.
+//
+// ONE RECIPROCAL, NOT TWO DIVIDES, AND THE COST IS MEASURED
+//
+// MAME divides twice per point with the same divisor. fp_div is 29 cycles and
+// does not pipeline, so two of them is 58 cycles against a 34-cycle-per-point
+// budget (docs/findings.md) - it cannot be afforded. One reciprocal and two
+// multiplies costs 29 and fits.
+//
+// It is not bit-identical, so the difference was measured rather than waved
+// through: over 8 million points at six zoom levels, spread across six decades
+// of depth, x*(1/z) lands on a different PIXEL than x/z in **0.002% of cases and
+// never by more than one pixel** - about half a vertex coordinate per frame at
+// 11,662 points. Recorded in docs/findings.md. That is the one place this design
+// is knowingly not bit-exact with the reference, and it is a rounding difference
+// in the last place of a value that is about to be truncated to an integer, not
+// a different algorithm.
+//
+// STRUCTURE. The reciprocal is the throughput limit at 29 cycles, so it is a
+// stage of its own and the multiply/add chain runs concurrently on the previous
+// point - the same shape as m2_geo_xform, and for the same measured reason.
+
+`timescale 1ns/1ps
+
+module m2_geo_project (
+  input  logic        clk,
+  input  logic        rst_n,
+
+  // Viewport parameters, all IEEE-754 single. xc/yc come from command 3, zoom
+  // from command 9 (as readf * 4), view from command 0x0c.
+  input  logic [31:0] xc, yc,
+  input  logic [31:0] zoomx, zoomy,
+  input  logic [31:0] viewx, viewy,
+
+  input  logic        in_valid,
+  output logic        in_ready,
+  input  logic [31:0] in_x, in_y, in_z,
+
+  // Shared arithmetic - see rtl/video/m2_fp_pool.sv.
+  output logic        mul_req,
+  output logic [31:0] mul_a, mul_b,
+  input  logic        mul_gnt,
+  input  logic        mul_rsp,
+  input  logic [31:0] mul_res,
+
+  output logic        add_req,
+  output logic [31:0] add_a, add_b,
+  output logic        add_sub,
+  input  logic        add_gnt,
+  input  logic        add_rsp,
+  input  logic [31:0] add_res,
+
+  output logic        div_req,
+  output logic [31:0] div_a, div_b,
+  input  logic        div_gnt,
+  input  logic        div_rsp,
+  input  logic [31:0] div_res,
+
+  output logic        out_valid,
+  output logic signed [31:0] out_sx, out_sy,   // pixels
+  // R626: THE QUARTER PIXEL BELOW THEM. out_sx is trunc(x); out_fx is the
+  // remainder in quarters, 0..3 (0 when x < 0 -- only the viewport's -1..0
+  // sliver). It is for the texture plane fit alone: every integer use of the
+  // vertex is unchanged. The fit through TRUNCATED vertices tilts the plane on
+  // small or steep polygons -- 13 to 58 texels on frame 2000's worst (the car
+  // numbers, Ben's "6") -- and quarter pixels take 89.9% of textured pixels
+  // within a texel to 96% in the model.
+  output logic [1:0]  out_fx, out_fy,
+  output logic [31:0] out_z,                   // passed through, for the sort
+  // R331: THE RECIPROCAL, KEPT INSTEAD OF THROWN AWAY.
+  //
+  // This module already computes 1/z per vertex -- a 29-cycle fp_div, the
+  // throughput limit of the whole projector -- and uses it for x*(1/z) and
+  // y*(1/z). It then discarded it, and R274 costed the perspective divide as
+  // though it would have to be built. It does not: the expensive part is paid
+  // here already and the texture path only has to be handed the answer.
+  //
+  // Zero when the vertex is behind the eye, because the float chain was never
+  // run for it (see r_behind); such a quad is culled before the fill sees it.
+  output logic [31:0] out_invz,
+  output logic        out_behind                // z <= 0: the (0,0) case
+);
+
+  // ------------------------------------------------------------ reciprocal
+  typedef enum logic [1:0] { R_IDLE, R_BUSY, R_FULL } rstate_t;
+  rstate_t rst_st;
+
+  logic [31:0] rx, ry, rz, recip;
+  logic        r_behind;
+
+  localparam logic [31:0] ONE = 32'h3f800000;
+
+  assign div_a = ONE;
+  assign div_b = rz;
+  wire        div_out_valid = div_rsp;
+  wire [31:0] div_result    = div_res;
+
+  // z > 0 means positive, nonzero and not a NaN. A NaN compares false against
+  // everything in C, so `z > 0` is false for it and MAME takes the behind path -
+  // reproduced by testing the sign bit AND that the value is not zero or NaN.
+  wire z_is_nan  = (in_z[30:23] == 8'hff) && (in_z[22:0] != 23'd0);
+  wire z_is_zero = (in_z[30:0] == 31'd0);
+  wire z_pos     = !in_z[31] && !z_is_zero && !z_is_nan;
+
+  logic div_started;
+  // No !busy term any more: the pool owns the divider's occupancy and simply
+  // withholds the grant, so the client asks and waits.
+  assign div_req = (rst_st == R_BUSY) && !div_started && !r_behind;
+
+  // ------------------------------------------------------------ scale stage
+  typedef enum logic [2:0] { S_IDLE, S_M0, S_M1, S_A0, S_A1, S_OUT, S_RND } sstate_t;   // R756: S_RND
+  sstate_t sst;
+
+  logic [31:0] s_f, sxx, syy, sr, sx_in, sy_in;   // R1021: s_f, one register for sx_f and sy_f
+  logic        s_behind;
+  logic [31:0] s_z;
+  logic [2:0]  step;
+  logic [1:0]  n_got;
+
+  wire        mul_out_valid = mul_rsp;
+  wire [31:0] mul_result    = mul_res;
+  wire        add_out_valid = add_rsp;
+  wire [31:0] add_result    = add_res;
+
+  // Two converters, not one muxed between the coordinates: the conversion is a
+  // shift and a negate, so a second instance is cheaper than the state it would
+  // take to reuse the first, and muxing one between sx_f and sy_f is how the
+  // first version of this module ended up never assigning out_sy at all.
+  // R952: the shift (mag8) is one instance after all, x's in S_A1's wait for
+  // y and y's in S_RND, each written into its own register; the increment
+  // and the negate stay two.
+  // R756: ROUNDED TO THE NEAREST QUARTER, NOT TRUNCATED. R626 truncated the
+  // pixel and the quarter separately toward zero, and gave a negative x no
+  // quarter at all. The clipper makes the same left-edge point more than once,
+  // a few ulp apart (x = -0.99999 and -1.00001), and truncation put one copy
+  // at 0 and the other at -1: a whole pixel, chosen by float noise, so it
+  // flipped as the camera moved -- a seam from the left edge and a flicker
+  // (Ben: the road shakes). Now one count of quarters, q = round(4x), half
+  // away from zero: |q| = (trunc(8|x|) + 1) >> 1. The pixel is q >>> 2
+  // (floor) and the quarter q[1:0], so a vertex is still sx + fx/4 exactly,
+  // negative or not, and copies within an eighth of a pixel of a quarter
+  // land on it together.
+  // TWO STAGES AT 80 MHz: S_RND registers only the magnitude trunc(8|x|) --
+  // a shift by the exponent less 124, no adder, no negate -- and S_OUT does
+  // the increment and the one negate. (The first form, the float times eight
+  // through fp_to_int and then abs, increment, negate in one cycle, missed
+  // by 2.8 ns: s852-s854.)
+  function automatic logic [31:0] mag8(input logic [31:0] f);
+    logic signed [9:0] e;
+    logic [23:0]       m;
+    e = $signed({2'b0, f[30:23]}) - 10'sd124;          // exponent of 8|x|
+    m = {1'b1, f[22:0]};
+    if (f[30:23] < 8'd124)              mag8 = 32'd0;   // |8x| < 1, denormals (e < 0; R1021: one compare, E == 0 is in it)
+    else if (e >= 10'sd23)              mag8 = 32'(m) << (e[4:0] - 5'd23);
+    else                                mag8 = 32'(m) >> (5'd23 - e[4:0]);
+  endfunction
+  logic [31:0] mx_r, my_r;          // trunc(8|x|): R952, x's in S_A1's wait, y's in S_RND
+  // R952: ONE mag8, sx_f's while S_A1 waits for y (sx_f landed, n_got 1),
+  // sy_f's in S_RND -- from the registers S_RND shifted before, one 2:1
+  // select in front. mx_r is written on every cycle of the wait (at least
+  // one: y lands no earlier than the cycle after x) and my_r in S_RND, so
+  // S_OUT reads the values S_RND used to form; nothing else reads them.
+  // R1021: and no select. sx_f and sy_f were read only here and for their
+  // signs, so they are one register, s_f, that takes each of S_A1's two sums
+  // as it lands: x's until y lands (every cycle mx_r is written), y's from
+  // then (S_RND, the one cycle my_r is written). The select from sst.S_RND and
+  // its fanout came off the front of the shifter (s2900: sst.S_RND -> mx_r,
+  // 8 levels, -0.436), and the |8x| < 1 test is the one compare E < 124.
+  wire  [31:0] m8_in = s_f;
+  wire  [31:0] m8    = mag8(m8_in);
+  wire         m8_bad = m8_in[30:23] > 8'd154;   // NaN / infinity (255), or e = E - 124 > 30
+  logic        sgx_r, sgy_r;        // signs
+  logic        qx_bad, qy_bad;      // NaN, infinity, or past 2^30 quarters
+  wire  [31:0] kx = (mx_r + 32'd1) >> 1, ky = (my_r + 32'd1) >> 1;
+  wire  signed [31:0] qx = sgx_r ? -$signed(kx) : $signed(kx);
+  wire  signed [31:0] qy = sgy_r ? -$signed(ky) : $signed(ky);
+
+  assign in_ready = (rst_st == R_IDLE);
+
+  // Two multiplies then two multiplies, then two adds then two adds. Each pair
+  // is issued back to back and collected before the next, which costs the FP
+  // latency three times over - 19 cycles - and is still well inside the 29 the
+  // reciprocal takes, so tightening it would buy nothing.
+  always_comb begin
+    mul_req = 1'b0; mul_a = '0; mul_b = '0;
+    add_req = 1'b0; add_a = '0; add_b = '0; add_sub = 1'b0;
+    case (sst)
+      S_M0: begin                       // xx = x*r, yy = y*r
+        mul_req = (step < 3'd2);
+        mul_a = (step == 3'd0) ? sx_in : sy_in;
+        mul_b = sr;
+      end
+      S_M1: begin                       // ax = xx*zoomx, ay = yy*zoomy
+        mul_req = (step < 3'd2);
+        mul_a = (step == 3'd0) ? sxx : syy;
+        mul_b = (step == 3'd0) ? zoomx : zoomy;
+      end
+      S_A0: begin                       // bx = ax+viewx, by = ay+viewy
+        add_req = (step < 3'd2);
+        add_a = (step == 3'd0) ? sxx : syy;
+        add_b = (step == 3'd0) ? viewx : viewy;
+      end
+      S_A1: begin                       // sx = xc+bx, sy = yc-by
+        add_req = (step < 3'd2);
+        add_a = (step == 3'd0) ? xc : yc;
+        add_b = (step == 3'd0) ? sxx : syy;
+        add_sub = (step == 3'd1);       // yc MINUS, the screen y axis is flipped
+      end
+      default: ;
+    endcase
+  end
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      rst_st <= R_IDLE; sst <= S_IDLE;
+      rx <= '0; ry <= '0; rz <= '0; recip <= '0; r_behind <= 1'b0;
+      div_started <= 1'b0;
+      sx_in <= '0; sy_in <= '0; sr <= '0; sxx <= '0; syy <= '0;
+      mx_r <= '0; my_r <= '0; sgx_r <= 1'b0; sgy_r <= 1'b0; qx_bad <= 1'b0; qy_bad <= 1'b0;   // R756
+      s_f <= '0; s_behind <= 1'b0; s_z <= '0;
+      step <= '0; n_got <= '0;
+      out_valid <= 1'b0; out_sx <= '0; out_sy <= '0; out_z <= '0; out_invz <= '0;
+      out_fx <= 2'd0; out_fy <= 2'd0;
+      out_behind <= 1'b0;
+    end else begin
+      out_valid <= 1'b0;
+
+      // ---------------------------------------------------- reciprocal stage
+      case (rst_st)
+        R_IDLE: begin
+          if (in_valid) begin
+            rx <= in_x; ry <= in_y; rz <= in_z;
+            r_behind    <= !z_pos;
+            div_started <= 1'b0;
+            rst_st      <= R_BUSY;
+          end
+        end
+        R_BUSY: begin
+          if (div_gnt) div_started <= 1'b1;
+          if (r_behind) begin
+            // No divide at all for a point behind the eye: MAME does not call
+            // project_point, it assigns zero. Spending 29 cycles to compute a
+            // number that is then discarded would halve the throughput on a
+            // frame full of back-facing geometry.
+            recip  <= '0;
+            rst_st <= R_FULL;
+          end else if (div_out_valid) begin
+            recip  <= div_result;
+            rst_st <= R_FULL;
+          end
+        end
+        R_FULL: begin
+          if (sst == S_IDLE) rst_st <= R_IDLE;
+        end
+        default: rst_st <= R_IDLE;
+      endcase
+
+      // ---------------------------------------------------- scale stage
+      case (sst)
+        S_IDLE: begin
+          if (rst_st == R_FULL) begin
+            sx_in <= rx; sy_in <= ry; s_z <= rz;
+            sr <= recip; s_behind <= r_behind;
+            step <= '0; n_got <= '0;
+            sst  <= r_behind ? S_OUT : S_M0;
+          end
+        end
+
+        S_M0, S_M1: begin
+          // Advance only on a grant: a shared multiplier can refuse a cycle, and
+          // stepping through the refusal drops an operand silently.
+          if (step < 3'd2 && mul_gnt) step <= step + 3'd1;
+          if (mul_out_valid) begin
+            if (n_got == 2'd0) sxx <= mul_result;
+            else               syy <= mul_result;
+            n_got <= n_got + 2'd1;
+            if (n_got == 2'd1) begin
+              step  <= '0;
+              n_got <= '0;
+              sst   <= (sst == S_M0) ? S_M1 : S_A0;
+            end
+          end
+        end
+
+        S_A0, S_A1: begin
+          if (step < 3'd2 && add_gnt) step <= step + 3'd1;
+          if ((sst == S_A1) && (n_got == 2'd1)) begin   // R952: x's, from sx_f
+            mx_r <= m8; sgx_r <= s_f[31]; qx_bad <= m8_bad;
+          end
+          if (add_out_valid) begin
+            if (n_got == 2'd0) begin
+              if (sst == S_A0) sxx <= add_result; else s_f <= add_result;   // R1021: x's
+            end else begin
+              if (sst == S_A0) syy <= add_result; else s_f <= add_result;   // R1021: y's
+            end
+            n_got <= n_got + 2'd1;
+            if (n_got == 2'd1) begin
+              step  <= '0;
+              n_got <= '0;
+              sst   <= (sst == S_A0) ? S_A1 : S_RND;   // R756
+            end
+          end
+        end
+
+        // R756: the rounding's own cycle -- an increment and a negate behind
+        // the converter's shifter, at 80 MHz.
+        S_RND: begin
+          my_r <= m8; sgy_r <= s_f[31]; qy_bad <= m8_bad;   // R952: y's (mx_r in S_A1)
+          sst  <= S_OUT;
+        end
+
+        S_OUT: begin
+          // Behind the eye is a literal (0,0), as MAME assigns - not a converted
+          // one, because the float chain was never run for it.
+          out_sx     <= s_behind ? 32'sd0 : qx_bad ? 32'sh80000000 : (qx >>> 2);   // R756
+          out_sy     <= s_behind ? 32'sd0 : qy_bad ? 32'sh80000000 : (qy >>> 2);
+          out_fx     <= (s_behind || qx_bad) ? 2'd0 : qx[1:0];
+          out_fy     <= (s_behind || qy_bad) ? 2'd0 : qy[1:0];
+          out_z      <= s_z;
+          out_invz   <= sr;                  // R331: 1/z, alongside z
+          out_behind <= s_behind;
+          out_valid  <= 1'b1;
+          sst        <= S_IDLE;
+        end
+
+        default: sst <= S_IDLE;
+      endcase
+    end
+  end
+
+endmodule

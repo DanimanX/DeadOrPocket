@@ -1,0 +1,1226 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Sega Model 2 core for MiSTer FPGA
+// Copyright (C) 2026 alphanu1
+//
+// THE GEOMETRIZER'S FRONT DOOR: two pointers and a push path.
+//
+// This is NOT a processor, and believing otherwise cost two study entries
+// (R124, R128; corrected by R130). `model2.cpp`:
+//
+//     void geo_prg_w(u32 data) {
+//         if (m_geoctl & 0x80000000) { m_geocnt++; }   // upload: COUNTS, DISCARDS
+//         else                       { push_geo_data(data); }
+//     }
+//     void push_geo_data(u32 d) { m_bufferram[m_geo_write_start_address/4] = d;
+//                                 m_geo_write_start_address += 4; }
+//
+// The microcode upload is thrown away by the reference, which hardcodes the
+// pipeline instead. So the 721,831 writes to 0x804000 over 900 attract frames
+// are overwhelmingly the game STREAMING ITS DISPLAY LIST into buffer RAM
+// through an auto-incrementing pointer. What this block owes the machine is
+// therefore small: keep two pointers, and put pushed dwords where they belong.
+//
+// WHY THE POINTERS MATTER ON THEIR OWN. `geo_r` returns geo_write_start_address
+// at 0x2008 and geo_read_start_address at 0x3008. This core returned 0 for both
+// -- that region falls into the bridge's T_IO default -- so the game set a
+// pointer, read back zero, and derived an address from it. That is the shape of
+// the livelock in R129: the i960 walking an unmapped 0x0163FBxx once buffer RAM
+// writes started landing.
+//
+// THE PUSH IS A DMA, NOT A BUS REMAP. Redirecting the CPU write inside
+// m2_cpu_bridge would mean rewriting sd_word underneath its S_LO/S_HI walk,
+// which splits a dword across two SDRAM words and selects the half from
+// r_addr[1]. Instead the write is acknowledged as ordinary I/O and queued here,
+// and this block drains the queue into the shared SDRAM write port -- the same
+// one the ROM loader, the self-test and the buffer initialiser take turns on.
+//
+// AND IT NEVER STALLS THE i960. The queue is an M10K FIFO deep enough that
+// `dbg_dropped` stays still: the game pushes about 800 dwords a frame, roughly
+// 48,000/s, against a drain of millions. If that counter ever moves, the depth
+// was wrong -- it is not a reason to add backpressure. Holding the i960 on a
+// coprocessor froze this machine once already.
+
+`timescale 1ns/1ps
+
+module m2_geo #(
+  parameter int unsigned AW    = 25,
+  parameter int unsigned DEPTH = 128,
+  // R826: "THE VBLANK AFTER A FLIP" MEANS A VBLANK THAT CAME AFTER THE FLIP.
+  // trig_after was frame_pend && flip_seen, and frame_pend is set at EVERY
+  // vblank and cleared only by a walk. When the game spends two frames on a
+  // list (Daytona's race on the board, R763) the vblank in the middle of its
+  // frame finds no flip, stays pending, and the flip itself then starts the
+  // walk mid-frame -- the list is drawn a frame earlier than the 2D scroll
+  // the game wrote for it (see m2_video SCR_SYNC). 1: a walk in mode 2 waits
+  // for a vblank that arrived with the flip already made. 0: unchanged.
+  parameter bit          AFTER_STRICT = 1'b0,
+  // R854: THE HOLD COVERS THE WALK'S OWN LIST BUFFER ONLY. 0: R638 as it was
+  // (a word in [w_ip, w_ip + HOLD_WIN) is held; after a jump every word is).
+  // N > 0: a word is held only if it lands in [start, start + N) of the list
+  // being walked -- at or past w_ip, or anywhere in it once the walk has
+  // jumped. Virtua Fighter 2 keeps four lists 8,192 dwords apart and jumps
+  // inside every one (MAME 0.289, 4,315 walks: starts 0x0000 / 0x2000 /
+  // 0x4000 / 0x6000 dwords, 3,322 with jumps, ends <= 3,033 dwords in), so
+  // R638's rule held the NEXT list, filled the push queue and stopped the
+  // i960 until the walk ended, every frame.
+  parameter int unsigned LIST_WIN = 0
+) (
+  input  logic          clk,
+  input  logic          rst_n,
+
+  // ---- the i960's side, decoded by the top level
+  input  logic          wr_ctl,          // 0x00980008  geo_ctl1
+  input  logic          wr_setwp,        // 0x00801008  set write pointer
+  input  logic          wr_setrp,        // 0x00803008  set read pointer
+  // WHICH MOMENT THE WALK STARTS ON, selectable at runtime because each
+  // candidate otherwise costs a 25-minute build AND a boot that is seed
+  // fragile. 0 flip (the 0x803008 write), 1 vblank (what this was before),
+  // 2 the vblank AFTER a flip, 3 the write-pointer write at 0x801008.
+  input  logic [1:0]    trig_mode,
+  // R699: FRAME SKIP -- 0 draws every flipped list, 1 every second, 2 every
+  // third (3 as 2). R711: A SKIPPED LIST IS STILL WALKED, BUT DRAWS NOTHING.
+  // A list is not only polygons: it uploads polygon and texture data, sets
+  // the light, the texture parameters, the window -- state every later list
+  // draws with. R699 did not walk skipped lists at all, so an upload or a
+  // lighting change that landed in one was simply lost: black spikes from
+  // polygon RAM never written, and scenes drawn unlit (R710). A skipped list
+  // now runs every command except object_data, which is announced to nobody,
+  // and its end is not a frame end -- the renderer never sees it.
+  input  logic [1:0]    skip,
+  input  logic          wr_push,         // 0x00800000-0fff and 0x00804000-7fff
+  input  logic [31:0]   wdata,
+
+  output logic [31:0]   rd_wp,           // 0x00802008
+  output logic [31:0]   rd_rp,           // 0x00803008
+
+  // ---- where buffer RAM lives, and the shared SDRAM write port
+  input  logic [AW:1]   base_buffer,
+  output logic          sd_wr_req,
+  output logic [AW:1]   sd_wr_addr,
+  output logic [15:0]   sd_wr_din,
+  input  logic          sd_wr_ack,
+  output logic          sd_busy,         // hold the port while a dword is in flight
+
+  output logic [31:0]   dbg_pushes,
+  output logic [31:0]   dbg_dropped,
+  output logic [15:0]   dbg_geocnt,
+  output logic [31:0]   dbg_geoctl,
+
+  // ---- the display-list walk (R135)
+  input  logic          frame_start,     // one pulse at vblank
+  output logic          rd_req,
+  output logic [18:0]   rd_addr,         // dword index into bufferram
+  input  logic [31:0]   rd_data,
+  input  logic          rd_ack,
+
+  // ---- GEOMETRY STATE, captured rather than skipped (R168)
+  //
+  // The walk used to step over every operand blind. These three opcodes carry
+  // the state the transform needs, and model2_v.cpp reads them straight:
+  //
+  //   geo_matrix_write   12 words -> matrix[0..11]
+  //   geo_focal_distance  2 words -> focus.x, focus.y
+  //   geo_object_data     4 words -> tpa, tha, oba, obc
+  //
+  // Exposed so the bench can check them against a list it built, and because
+  // the polygon fetch consumes oba/obc next.
+  output logic [31:0]   mtx0, mtx4, mtx8, mtx11,  // corners of the 3x4, enough to prove order
+  // THE MATRIX AS A STREAM, not as twelve wires. The capture below already
+  // takes one operand per acknowledge in reference order, so the write enable,
+  // the index and the word are simply that loop made visible. m2_geo_xform
+  // wants exactly this shape (mat_we/mat_idx/mat_data), so nothing is
+  // reformatted between here and there -- and a 384-wire bundle never exists.
+  output logic          mat_we,
+  output logic [3:0]    mat_idx,
+  output logic [31:0]   mat_data,
+  // THE INTERLOCK. The walk and the geometry engine read the SAME SDRAM port,
+  // and two owners on one port is what cost this project four days (study
+  // R167). Rather than arbitrate, they take turns: the walk stops at an
+  // object_data until the engine has drained that object. It is what the
+  // reference does anyway -- geo_object_data does not return until geo_parse
+  // has walked every polygon -- so the serialisation is not a concession.
+  input  logic          eng_busy,
+  // The two polygon RAMs, in SDRAM. geo_object_data picks between them and the
+  // polygon ROM from oba's top bits; geo_polygon_data (0x05) writes into them.
+  input  logic [AW:1]   base_pram0,
+  input  logic [AW:1]   base_pram1,
+  // R222: TEXTURE RAM, 64 K x 16 in SDRAM. geo_texture_data (0x04) writes
+  // it when its address has bit 23 set (clear is log RAM, for the texture
+  // LOD, still stepped over); the reference stores the LOW 16 BITS of each
+  // payload dword at texture_ram[(addr + i) & 0xffff]. 3% of the title's
+  // objects take their texture header from here.
+  input  logic [AW:1]   base_texram,
+  output logic [15:0]   dbg_td_words,    // words written into texture RAM
+  output logic [15:0]   dbg_pd_words,    // dwords written into polygon RAM
+  output logic [15:0]   dbg_pd_cmds,     // geo_polygon_data commands executed
+  output logic [31:0]   foc_x, foc_y,
+  // geo_light_source (0x0a): three words, the light vector. Lighting on Model 2
+  // is dot(normal, light) against dot(normal, point), so this is half of what
+  // the luminance needs and the polygon's own normal is the other half.
+  output logic  [7:0]   zadj_e,      // R246: op 0x08's operand, exponent byte -- the z-sort bias
+  // R642: geo_window_data (0x03), READ rather than stepped over. Its words are
+  // {x[27:16], y[11:0]}, twelve-bit signed each: the viewport's start and end
+  // corners and the projection centre for eye mode 0 (the only one Daytona
+  // selects, R641). win_cnt steps once per command, after all six are in.
+  output logic [31:0]   win_vp_s, win_vp_e, win_c0,
+  output logic  [7:0]   win_cnt,
+  // R889: THE WINDOW AN OBJECT IS DRAWN IN, counted per walk as the
+  // reference's raster->cur_window is (render_frame_start sets 0, each
+  // window_data adds one), saturated at 15 and latched with obj_valid. MAME
+  // renders window by window from the last down to 0, each over everything
+  // after it -- the HUD's later window over the scene whatever the z. Unread
+  // unless the geometry's WINKEY is set.
+  output logic  [3:0]   obj_win,
+  output logic [31:0]   lit_x, lit_y, lit_z,
+  output logic [15:0]   dbg_lit_n,
+  // R255: NOPS DECODED THIS FRAME. A well-formed list holds none; a walk that
+  // has lost sync reads the payload of a count-driven command as commands, and
+  // a run of zero words decodes as a run of nops. The desk measured 417 a
+  // frame against the reference's none, but that turned out to be the bench's
+  // own malformed list (R254), so the board has to be asked directly.
+  output logic [15:0]   dbg_nops,
+  // R263: WHICH TRIGGER STARTED EACH WALK. The board reports a nop count that
+  // is zero on most frames and 280 on a few, and 280 is the length of the
+  // texture_data payload -- so a minority of walks still read the list while
+  // the count the game patches in afterwards is still a placeholder. Mode 0
+  // walks on the game's own "list ready" write to 0x803008, with a FALLBACK
+  // that walks at vblank when no such write has been seen for four frames.
+  // A fallback walk has no promise that the list is finished, so if the bad
+  // walks are fallback walks this says so outright.
+  output logic [15:0]   dbg_walk_flip,
+  output logic [15:0]   dbg_walk_fallback,
+  // R608: list words the game wrote AT OR AHEAD of the walk while it was
+  // walking -- the walked list overwritten before it was read. Since R638,
+  // only words into the walk's hold window count: zero is the answer.
+  // Wraps; the stream takes deltas.
+  output logic [15:0]   dbg_overtake,
+  // R260: BACKPRESSURE, DONE PROPERLY. The queue between the i960 and SDRAM
+  // drops when full, and a drop is a HOLE: the write pointer deliberately does
+  // not advance, so the next dword takes the missing one's slot. The reference
+  // writes its whole 32-entry light table in ONE command of 64 payload words
+  // and every entry it writes is non-zero (measured: 127/63, 127/47, 127/111,
+  // 255/255, ... with 255/255 for the unused upper half). The board's table
+  // holds nineteen entries at 0/0, so that payload is being disturbed, and the
+  // drop counter climbs continuously. The reference cannot drop -- it has no
+  // queue -- and real hardware holds the CPU off instead.
+  output logic          push_stall,
+  // R697: words pushed and not yet in buffer RAM -- the queue holds one, or the
+  // drain is writing one. The CPU's own buffer-RAM stores wait on this.
+  output logic          push_busy,
+  // geo_texture_parameters (0x06) as a WRITE STREAM, the same shape as the
+  // matrix's. Model 2's luminance is
+  //     luminance * texparam->diffuse + texparam->ambient
+  // with the entry chosen per polygon by (attr >> 18) & 0x1f, so the table has
+  // 32 entries and both fields are 8-bit. Streaming it keeps the table where it
+  // is used rather than routing 32 entries out of the walker.
+  output logic          tp_we,
+  // R905: and each entry's distance coefficient (the second word, which MAME
+  // keeps as coef_table[index] for the texture LOD), as its IEEE exponent and
+  // top four mantissa bits, one cycle after tp_we on the same tp_idx; and the
+  // LOD command's (0x16) operand, the same twelve bits. m2_geometry's no-mip
+  // flag takes both for the large layout's games (R905).
+  output logic          tc_we,
+  output logic  [11:0]  tc_l,
+  output logic  [11:0]  lod_l,
+  output logic  [4:0]   tp_idx,
+  output logic  [7:0]   tp_diffuse,
+  output logic  [7:0]   tp_ambient,
+  output logic [15:0]   dbg_tp_n,
+  output logic [31:0]   obj_tpa, obj_tha, obj_oba, obj_obc,
+  output logic          obj_valid,       // one pulse when an object_data is complete
+  output logic [15:0]   dbg_mtx_n,       // matrices captured
+  output logic [15:0]   dbg_foc_n,       // focal writes captured
+
+  output logic [15:0]   dbg_walk_ops,    // opcodes retired this frame
+  output logic [15:0]   dbg_walk_objs,   // object_data commands seen
+  output logic [15:0]   dbg_walk_frames, // walks completed
+  output logic [7:0]    dbg_walk_unknown,
+  // WHICH STATE THE WALK IS SITTING IN. A frozen frame counter says only that
+  // it stopped; this says why. Exposed rather than inferred because every
+  // guess at it so far has cost a 40-minute build.
+  output logic [3:0]    dbg_walk_state, // an opcode the table does not cover
+  // THE TWO POINTERS, because the walk now runs 900 times in twenty seconds
+  // and retires one to three opcodes each time. That is a walk starting on an
+  // empty list, and the only way to tell an empty list from a walk aimed at
+  // the wrong buffer is to see where it starts against where the pushes land.
+  output logic [19:0]   dbg_rp,          // where the walk starts (0x00803008)
+  output logic [19:0]   dbg_wp,          // where the pushes land (0x00801008)
+  // R826: one pulse as a walk starts -- the top level tags the list with it.
+  output logic          walk_started
+);
+
+  // ---------------------------------------------------------------- registers
+  logic [31:0] geoctl;
+  logic [19:0] geo_wp, geo_rp;
+  logic [15:0] geocnt;
+
+  wire uploading = geoctl[31];
+
+  assign rd_wp      = {12'd0, geo_wp};
+  assign rd_rp      = {12'd0, geo_rp};
+  assign dbg_rp     = geo_rp;
+  assign dbg_wp     = geo_wp;
+  assign dbg_geocnt = geocnt;
+  assign dbg_geoctl = geoctl;
+
+  // A push only queues when the reference would have queued it: in upload mode
+  // the data is counted and discarded, exactly as geo_prg_w does.
+  wire push_now = wr_push && !uploading;
+  // ONE PUSH PER ACCESS. `wr_push` is a single-cycle pulse under the bridge's
+  // ordinary handshake, but while `io_stall` is held the bridge RE-ASSERTS its
+  // select every cycle, so it becomes a LEVEL -- and the first version of this
+  // pushed the same dword again on every cycle after the queue made room. The
+  // board showed that as the walk's nop count going from 4 to 280.
+  // A NEW ACCESS IS THE STROBE RISING **OR** THE DATA CHANGING. The bridge
+  // pulses `wr_push` once per access, so the falling edge alone would do -- but
+  // a pusher that holds the strobe across two words is a legal thing to model
+  // and `tb_m2_geo` does exactly that, so the dword itself marks the boundary
+  // too. The only case the two cannot separate is the same value pushed twice
+  // under one continuous strobe, which no access pattern here produces.
+  logic push_done;
+  logic [31:0] wdata_d;
+  wire  push_fire = push_now && !q_full && !push_done;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      push_done <= 1'b0; wdata_d <= 32'd0;
+    end else begin
+      wdata_d <= wdata;
+      if (!wr_push || (wdata != wdata_d)) push_done <= 1'b0;
+      else if (push_fire)                 push_done <= 1'b1;
+    end
+  end
+  assign push_stall = push_now && q_full && !push_done;
+
+  // THE DESTINATION TRAVELS WITH THE DWORD. The queue decouples the push from
+  // the drain, so a drain-side counter would be wrong the moment the game sets
+  // the write pointer with 0x801008 -- the queued words would land where the
+  // pointer USED to be. 52 bits wide: {byte pointer, dword}.
+  logic        q_valid;
+  logic [51:0] q_data;
+  logic        q_pop;
+  logic [15:0] q_count;
+  logic        q_full;
+  logic        q_held;   // R747: a pushed word anywhere in the queue
+
+  m2_fifo_m10k #(.DW(52), .DEPTH(DEPTH)) u_pushq (
+    .clk(clk), .rst_n(rst_n),
+    .push(push_fire), .din({geo_wp, wdata}),
+    .pop(q_pop), .q(q_data), .q_valid(q_valid),
+    .full(q_full), .count(q_count), .dropped(dbg_dropped),
+    .held(q_held)   // R747
+  );
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      geoctl <= 32'd0; geo_wp <= 20'd0; geo_rp <= 20'd0;
+      geocnt <= 16'd0; dbg_pushes <= 32'd0;
+    end else begin
+      // geo_ctl1_w: the hi bit CHANGING starts or ends an upload, and starting
+      // one resets the count. The reference watches the transition, not the level.
+      if (wr_ctl) begin
+        if ((wdata ^ geoctl) == 32'h8000_0000 && wdata[31]) geocnt <= 16'd0;
+        geoctl <= wdata;
+      end
+      if (wr_setwp) geo_wp <= wdata[19:0];
+      if (wr_setrp) geo_rp <= wdata[19:0];
+
+      // Upload mode counts and drops on the floor, as the reference does.
+      if (wr_push && uploading && !(&geocnt)) geocnt <= geocnt + 16'd1;
+
+      // The pointer advances when the dword is ACCEPTED, not when it lands --
+      // the game reads it back to find where it is, and it is four ahead of the
+      // last word it wrote. A drop must not advance it, or the list gains a hole
+      // AND a wrong pointer.
+      if (push_fire) begin
+        geo_wp <= geo_wp + 20'd4;
+        if (!(&dbg_pushes)) dbg_pushes <= dbg_pushes + 32'd1;
+      end
+    end
+  end
+
+  // ------------------------------------------------------ the drain, one dword
+  // Two 16-bit writes, low half first: the bridge reads back the half selected
+  // by r_addr[1], so an EVEN word index must hold bits 15:0.
+  typedef enum logic [1:0] { D_IDLE, D_LO, D_HI, D_NEXT } dstate_t;
+  dstate_t dst;
+  // R747: q_held, not q_valid. The queue is an M10K FIFO and a pushed word
+  // reaches its head two cycles after the push (array, then the read in
+  // flight), and between words while it drains the head is empty for a cycle
+  // with words still behind it. q_valid was 0 in all of those cycles, so the
+  // CPU's count patch could pass R697's gate with the placeholder still
+  // queued -- the walker then read a zero count and the light table filled
+  // with 0/0 (board, s827: every entry (0,0), every polygon luminance 0).
+  assign push_busy = q_held || (dst != D_IDLE);   // R697, R747
+  logic [19:0] wr_ptr;
+  logic [15:0] dw_hi;
+
+  // Deliberately unread, and named so lint does not have to guess: the queue's
+  // occupancy is covered by `dropped`, the walk only needs an opcode's top and
+  // jump fields out of rd_data, and wr_ptr's high bits and bit 0 fall outside
+  // bufferram's 128 KB.
+  // pd_addr's unused bits: bit 24 chooses the memory and [14:0] indexes inside
+  // it, exactly as geo_polygon_data's `address & 0x01000000` and `& 0x7fff` do.
+  // Everything between and above is address the reference never looks at.
+  wire _unused_geo = &{1'b0, q_count, rd_data[30:28], rd_data[22:17],
+                       wr_ptr[19:17], wr_ptr[0],
+                       pd_addr[31:25], pd_addr[23:15], 1'b0};
+
+  // THE WRITE DMA NOW HAS TWO CLIENTS AND STILL ONE OWNER.
+  //
+  // geo_polygon_data has to write dwords into polygon RAM, and the front door's
+  // push DMA already writes dwords into buffer RAM through sd_wr_*. Adding a
+  // second driver of that port is the mistake that cost this project four days
+  // (R167) and is still live on the loader's write port (R144). So the port
+  // keeps exactly one owner -- this state machine -- and gains a second source
+  // feeding it. It handles one dword at a time, so the two cannot interleave.
+  //
+  // The walk has priority because it is synchronous: it is stopped waiting for
+  // pd_done, while the front door's queue is asynchronous and drops on
+  // backpressure by design ("overrun: 3205 dropped, counted, never stalled").
+  logic        pd_req;             // from the walk
+  logic [AW:1] pd_waddr;           // word address of the dword's low half
+  logic [31:0] pd_wdata;
+  logic        pd_ack;             // one pulse when the DMA TAKES the request
+  logic        pd_done;            // one pulse when both halves are written
+  logic        pd_active;          // this transfer belongs to the walk
+
+  // Word address of the dword's low half: base + (index << 1). The index wraps
+  // inside the 32K-dword window the reference masks reads to.
+  wire [14:0]  pd_widx  = pd_addr[14:0] + pd_i[14:0];
+  wire [AW:1]  pd_wbase = pd_addr[24] ? base_pram1 : base_pram0;
+  // R222: texture RAM is 16-bit words, one per payload dword, and wraps in 64 K.
+  wire [15:0]  td_widx  = pd_addr[15:0] + pd_i;
+  assign pd_waddr = pd_tex ? (base_texram + AW'(td_widx))
+                           : (pd_wbase + AW'({pd_widx, 1'b0}));
+
+  assign sd_busy = (dst != D_IDLE);
+  // R610: THE QUEUE DOES NOT DRAIN WHILE A WALK RUNS (narrowed by R638,
+  // below: the premise was wrong). Daytona's list is
+  // single-buffered at address 0 and the next one is pushed while this walk
+  // is still reading it; R608 counted 3,795+ words written ahead of the walk
+  // in 152 s and caught walks retiring 3 opcodes (the scenery dropout). Held
+  // here, the words wait in the queue; when it fills, push_stall holds the
+  // CPU -- a FIFO pacing its writer, which is what the board's geometrizer
+  // does -- and the walk always reads the list it was started on. The walk's
+  // own polygon-data writes (pd_req) are not held.
+  logic walk_active;
+  // R638: ONLY THE WALK'S OWN LIST IS HELD. R610 held every pushed word for
+  // the whole walk. But Daytona DOUBLE-buffers -- MAME 0.289, 180 s of attract:
+  // 10,355 walks alternating between dword 0x0000 and 0x4000 every frame, no
+  // jumps, lists at most 2,057 dwords -- so while one list is walked the CPU
+  // (the loop at 0x19f58) is writing the OTHER buffer, which the walk never
+  // reads. Holding those filled the queue and stalled the CPU until the walk
+  // ended, so every game frame took two vblanks (telemetry lite: 2.03; MAME
+  // 1.00). R211's "single-buffered at 0, a list every second frame" was read
+  // off this core while it was already running at half speed.
+  //
+  // A word is held only if it lands in [w_ip, w_ip + HOLD_WIN): at or ahead
+  // of the walk and close enough to be its list. The walk reads only at w_ip
+  // and moves forward, so a word below w_ip has been read. HOLD_WIN is 12,288
+  // dwords, six times the longest list, and still short of the other buffer.
+  // A jump breaks "below = read", so after one the hold is total again for the
+  // rest of that walk (Daytona never jumps; a word let through before a jump
+  // back is the case this does not cover).
+  localparam logic [18:0] HOLD_WIN = 19'h3000;
+  logic walk_jumped;
+  logic [18:0] w_start;   // R854: the dword the walk started at
+  wire [18:0] q_dw     = 19'(q_data[48:34]);
+  wire        q_in_win = (q_dw >= w_ip) && (q_dw < w_ip + HOLD_WIN);
+  wire [18:0] q_rel    = q_dw - w_start;   // wraps: below the start is far away
+  localparam logic [18:0] LWIN = 19'((LIST_WIN == 0) ? 1 : LIST_WIN);   // 0 never reaches the compare
+  wire        q_in_lst = (q_rel < LWIN);
+  wire        pop_ok   = (LIST_WIN == 0)
+                         ? (!walk_active || (!walk_jumped && !q_in_win))
+                         : (!walk_active || !q_in_lst || (!walk_jumped && (q_dw < w_ip)));
+  assign q_pop   = (dst == D_IDLE) && !pd_req && q_valid && pop_ok;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      dst <= D_IDLE; sd_wr_req <= 1'b0; sd_wr_addr <= '0; sd_wr_din <= 16'd0;
+      wr_ptr <= 20'd0; dw_hi <= 16'd0;
+      pd_done <= 1'b0; pd_active <= 1'b0; pd_ack <= 1'b0;
+    end else begin
+      pd_done <= 1'b0;
+      pd_ack  <= 1'b0;
+      case (dst)
+        // ACKNOWLEDGE ON ACCEPTANCE, NOT ON COMPLETION, and this is not style.
+        //
+        // With the walk clearing pd_req only on pd_done, the request was still
+        // high for the cycle after D_NEXT returned here -- so the DMA started
+        // the SAME dword a second time, and by then the walk had advanced pd_i,
+        // so the second copy's high half landed one dword too far:
+        //
+        //     WR 0x80 <= 1111   WR 0x81 <= 1111    the correct pair
+        //     WR 0x80 <= 1111   WR 0x83 <= 1111    the spurious one
+        //
+        // The low half was harmlessly rewritten and the high half corrupted the
+        // NEXT dword's slot, so the copy looked almost right: the first dword
+        // and the last were correct and the middle ones were not.
+        D_IDLE: if (pd_req) begin
+          pd_ack     <= 1'b1;
+          pd_active  <= 1'b1;
+          dw_hi      <= pd_wdata[31:16];
+          sd_wr_addr <= pd_waddr;
+          sd_wr_din  <= pd_wdata[15:0];
+          sd_wr_req  <= 1'b1;
+          dst        <= D_LO;
+        end else if (q_valid && pop_ok) begin   // R610/R638: as q_pop
+          pd_active  <= 1'b0;
+          wr_ptr     <= q_data[51:32];
+          dw_hi      <= q_data[31:16];
+          sd_wr_addr <= base_buffer + AW'(q_data[48:33]);   // (ptr & 0x1ffff) >> 1
+          sd_wr_din  <= q_data[15:0];
+          sd_wr_req  <= 1'b1;
+          dst        <= D_LO;
+        end
+        D_LO: if (sd_wr_ack) begin
+          sd_wr_req  <= 1'b0;
+          if (pd_active && pd_tex) begin
+            // R222: texture RAM takes the low half only; done after one word.
+            pd_done   <= 1'b1;
+            pd_active <= 1'b0;
+            dst       <= D_IDLE;
+          end else begin
+            sd_wr_addr <= pd_active ? (pd_waddr + AW'(1))
+                                    : (base_buffer + AW'(wr_ptr[16:1]) + AW'(1));
+            sd_wr_din  <= dw_hi;
+            dst        <= D_HI;
+          end
+        end
+        D_HI: begin
+          sd_wr_req <= 1'b1;
+          dst       <= D_NEXT;
+        end
+        D_NEXT: if (sd_wr_ack) begin
+          sd_wr_req <= 1'b0;
+          if (pd_active) pd_done <= 1'b1;
+          pd_active <= 1'b0;
+          dst       <= D_IDLE;
+        end
+        default: dst <= D_IDLE;
+      endcase
+    end
+  end
+
+  logic [15:0] push_seq, land_seq, flip_seq;   // R752: flip_seq is the walk's
+  // R752: words pushed, and pushed words landed (the queue's own, not the
+  // walk's polygon-data writes). The walk compares the second with the first
+  // as it stood at the flip.
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      push_seq <= 16'd0; land_seq <= 16'd0;
+    end else begin
+      if (push_fire) push_seq <= push_seq + 16'd1;
+      if ((dst == D_NEXT) && sd_wr_ack && !pd_active) land_seq <= land_seq + 16'd1;
+    end
+  end
+
+  // ======================================================================
+  // THE DISPLAY-LIST WALK
+  //
+  //     input = &bufferram[geo_read_start_address/4]
+  //     op = *input++
+  //     if (op & 0x80000000) input = &bufferram[(op & 0x1ffff)/4]   -- jump
+  //     else consume the operand words this opcode takes
+  //     bounded by 0x8000 opcodes and the end of bufferram
+  //
+  // EIGHT OPCODES, NOT TWENTY-ONE. Walking the real list dumped out of MAME
+  // retires 101 commands and reaches `end` cleanly using only:
+  //
+  //     object_data 60   matrix_write 33   focal 2   light 2
+  //     zsort 1          window_data 1     texture_data 1   end 1
+  //
+  // None of the six handlers whose length could not be confirmed appear at all.
+  // The count for the variable ones is READ FROM THE STREAM as the second
+  // operand, not decoded out of the opcode -- that was the open question.
+  //
+  // This walks and counts. It does not yet transform anything: object_data's
+  // four words name geometry that lives in the POLYGON ROM, and that is the
+  // next stage. Getting the walk right first means the opcode histogram on the
+  // UART can be compared against the 101/60/33 above, which is a real oracle.
+  typedef enum logic [3:0] { W_IDLE, W_FETCH, W_DECODE, W_SKIP, W_CNT,
+                             W_TFIFO, W_DDSKIP, W_DDATTR, W_OPRD, W_OBJW,
+                             W_PDA, W_PDR, W_PDW,
+                             W_TPI, W_TPP, W_TPC } wstate_t;
+  wstate_t wst;
+  logic [18:0] w_ip;
+  logic [15:0] w_ops, w_skip;
+  logic [4:0]  w_op;
+
+  // Operand words per opcode. The upper half mirrors the lower for the ones
+  // this game uses, exactly as geo_process_command's switch does.
+  // ALL THIRTY-TWO ENTRIES, NOT THE LOW NIBBLE. The upper half mirrors the
+  // lower for most commands, but NOT for three pairs, and keying on four bits
+  // gets every one of them wrong:
+  //
+  //     0x0d data_mem_push 2+count   vs  0x1d code_upload  1+3*count
+  //     0x0e test          complex   vs  0x1e code_jump    1
+  //     0x06 texture_params 2+2*cnt  vs  0x16 lod          1
+  //
+  // A count-driven command carries its length in the stream. `preop` is how many
+  // operands come BEFORE the count word, `mult` how many words each unit takes:
+  //
+  //     2 + count      preop 1, mult 1   texture_data, polygon_data,
+  //                                      data_mem_push, log_data
+  //     2 + 2*count    preop 1, mult 2   texture_parameters
+  //     1 + 3*count    preop 0, mult 3   code_upload
+  //
+  // 0x02/0x12 direct_data IS covered. Its length is set by a while loop rather
+  // than a count, but a loop is not an unknown: geo_direct_data takes tpa and
+  // tha, then two xyz points, then reads an attribute word and continues while
+  // its low two bits are nonzero -- 5 more words per vertex, 8 if bit 0 says
+  // quad rather than triangle. The terminating attribute is consumed too:
+  // `while (((attr = *input++) & 3) != 0)` steps past it on the exit test.
+  //
+  // ALL THIRTY-TWO OPCODES NOW HAVE A LENGTH. geo_process_command has no
+  // default case, so there is no such thing as an opcode the reference cannot
+  // measure -- halting was a stopgap, not a limit of what is knowable. The
+  // unknown branch below is kept as an assertion that should never fire.
+  //
+  // 0x0e test IS covered, and it is the reason the walk stopped on the board
+  // after 141 frames (dbg_walk_unknown reported 0x0e, which is the opcode, not
+  // a count). geo_test is the SELF TEST: it checks a 1,2,4,8... ramp through
+  // the FIFO and then checksums blocks of polygon ROM. It writes nothing and
+  // changes no geometrizer state -- on failure MAME only logerrors, and the
+  // real board lights an LED. So the walk owes it nothing but the right length:
+  //
+  //     32 words   the FIFO ramp
+  //    + 1 word    the block count
+  //    + 3*blocks  address, count, checksum per block
+  //
+  // Note where the count sits: at operand offset 32, not offset 1 like every
+  // other count-driven command, which is why it needs its own state rather
+  // than another entry in the preop/mult table above.
+  function automatic [15:0] oplen(input [4:0] c);
+    case (c)
+      5'h00, 5'h0f, 5'h1f:               oplen = 16'd0;   // nop, end
+      5'h07, 5'h08, 5'h10, 5'h16,
+      5'h17, 5'h18, 5'h1e:               oplen = 16'd1;   // mode, zsort, dummy,
+                                                          // lod, code_jump
+      5'h09, 5'h19:                      oplen = 16'd2;   // focal distance
+      5'h0a, 5'h0c, 5'h1a, 5'h1c:        oplen = 16'd3;   // light, translate
+      5'h01, 5'h11:                      oplen = 16'd4;   // object_data
+      5'h03, 5'h13:                      oplen = 16'd6;   // window_data
+      5'h0b, 5'h1b:                      oplen = 16'd12;  // matrix, 3x4
+      // 0x02/0x12 direct_data and 0x0e test have their own states, never here.
+      default:                           oplen = 16'hffff;
+    endcase
+  endfunction
+
+  // count-driven forms
+  wire is_cnt1 = (w_op == 5'h04) || (w_op == 5'h05) || (w_op == 5'h14)
+              || (w_op == 5'h15) || (w_op == 5'h0d);       // 2 + count
+  wire is_pd   = (w_op == 5'h05) || (w_op == 5'h15);        // polygon_data
+  wire is_td   = (w_op == 5'h04);                           // texture_data (R222)
+  wire is_cnt2 = (w_op == 5'h06);                          // 2 + 2*count
+  wire is_cnt3 = (w_op == 5'h1d);                          // 1 + 3*count
+  wire is_test = (w_op == 5'h0e);                          // 32 + 1 + 3*blocks
+  wire is_dd   = (w_op == 5'h02) || (w_op == 5'h12);       // 8 + attribute loop
+  wire is_var  = is_cnt1 || is_cnt2 || is_cnt3;
+  wire is_end  = (w_op == 5'h0f) || (w_op == 5'h1f);
+
+  // The captured geometry state. `mtx` is the live matrix the transform will
+  // use; only four of its words are brought out, which is enough to prove the
+  // order is right without routing 384 wires to the top level.
+  logic [31:0] mtx [12];
+  logic [2:0]  w_cap;                    // which opcode's operands are being read
+  logic [3:0]  w_ci;                     // operand index
+  logic        eng_seen;                 // the engine's busy has been observed high
+  // WALK ON THE GAME'S FLIP, NOT ON VBLANK.
+  //
+  // A vblank-triggered walk reads a display list the i960 is still writing. The
+  // boot bench shows it directly: a word reads 0x0000002e correctly for ninety
+  // frames and then 0xffffffff, because the CPU cleared that region mid-walk --
+  // 120,317 such clears go through the front door in one run. The walker then
+  // copies all-ones into polygon RAM, every vertex has exponent 0xFF, and
+  // m2_geometry's non-finite gate refuses 17,315 polygons. What survives is a
+  // handful of degenerate quads.
+  //
+  // Model 1 hit this and solved it, and its m1_raster3d.sv says what it looks
+  // like on a screen: "a pass beginning the moment its bank was free walks a
+  // list the V60 is halfway through writing, and showed on the board as
+  // geometry in the wrong place with vertices collapsed toward the origin. The
+  // flip is precisely the moment at which that cannot happen." Its trigger is
+  //
+  //     prod_trig = (list_flipped && ...) || (frame_start && no_flips)
+  //
+  // Model 2's flip is the game writing the READ POINTER at 0x00803008. Measured
+  // on the reference: Daytona writes it 492 times in 600 frames -- every second
+  // frame, right after it sets the write pointer -- and the address is always 0,
+  // so the game single-buffers and uses the WRITE ITSELF as "the list is ready".
+  // R638 CORRECTS THIS: MAME 0.289 walks 57.5 lists a second, alternating
+  // dword 0x0000 / 0x4000 -- one flip a frame, double-buffered. The write IS
+  // still "the list is ready"; "every second frame" was this core's own rate.
+  //
+  // frame_pend stays as the fallback for a list that has not flipped, which is
+  // what a bench or a game that never writes rp needs, and it is held off while
+  // flips are arriving so it cannot pre-empt one and walk the stale list -- the
+  // same guard Model 1 uses.
+  logic        frame_pend;
+  logic        flip_pend;
+  logic [2:0]  fs_since_flip;            // frame pulses since the last flip, saturating
+  // wr_setrp is formed in the CPU's clock domain from cpu_io_sel; using it
+  // directly here put a cross-domain path into this block and cost 0.34 ns of
+  // HOLD -- +0.169 before the change, -0.231 after, on the same seed 1604, and
+  // negative on all five seeds tried. Registering it locally breaks that path.
+  // The pulse is several clk cycles wide at the CPU's 24 MHz against this
+  // domain, so a single flop cannot miss it.
+  logic        setrp_q;
+  logic [9:0]  drain_wait;
+  // R752: q_held, as R747 made push_busy -- q_valid is 0 between words while
+  // the M10K queue drains.
+  wire         q_idle   = !q_held && (dst == D_IDLE);
+  // R752: A FLIP'S WALK WAITS FOR ITS OWN WORDS, AND ONLY THOSE. The walk
+  // started on q_idle or after drain_wait's 1,023 cycles. But after a flip the
+  // game at once pushes its next list into the other buffer, so the queue is
+  // rarely idle and the walk started on the timeout -- with this list's tail
+  // possibly still queued. Those words then sat in the walk's own hold window
+  // (R638) for the whole walk, which read the previous frame's words there:
+  // a desync, decoded as a nop or two, and now and then as a phantom
+  // texture_parameters that zeroes the light table for good (board, s845:
+  // the genuine 0x06 at boot, a second one at 3.8 minutes, black from that
+  // frame). Every word pushed before the flip is counted at the flip; the
+  // walk starts when that many have landed. Pushes after it are the next
+  // list's and do not hold it.
+  wire  [15:0] land_less   = land_seq - flip_seq;   // wraps; the queue is 128 deep
+  wire         flip_landed = !land_less[15];
+  wire         _unused_r752 = &{1'b0, land_less[14:0]};   // only the sign is asked
+  wire         no_flips = fs_since_flip[2];
+  // The reference says the 0x803008 write IS "the list is ready" -- Daytona
+  // writes it every second frame right after the write pointer, always to
+  // address 0, single-buffered (R638: double-buffered, every frame -- see
+  // above). So mode 0 should be the correct one and the
+  // others exist to prove that rather than to be believed.
+  logic        setwp_q;
+  logic        wp_pend;
+  logic        flip_seen;                // a flip has happened since the last walk
+  logic  [1:0] skip_cnt;                 // R699: flips skipped since the last walked one
+  logic        nd_pend;                  // R711: the pending flip is a skipped list
+  logic        nodraw;                   // R711: this walk runs state only
+  wire         trig_flip   = flip_pend || (frame_pend && no_flips);
+  wire         trig_vblank = frame_pend;
+  logic        vbl_after_flip;           // R826: a vblank has come since the flip
+  wire         trig_after  = frame_pend && flip_seen && (!AFTER_STRICT || vbl_after_flip);
+  wire         trig_setwp  = wp_pend || (frame_pend && no_flips);
+  wire         trig_sel    = (trig_mode == 2'd0) ? trig_flip   :
+                             (trig_mode == 2'd1) ? trig_vblank :
+                             (trig_mode == 2'd2) ? trig_after  : trig_setwp;
+  wire         walk_go  = trig_sel && (flip_pend ? flip_landed               // R752
+                                                 : (q_idle || (&drain_wait)));
+  logic [31:0] pd_addr;                  // geo_polygon_data's destination
+  // R760: THE OBJECT'S CENTRE IS ONE OF FOUR. MAME (model2_v.cpp):
+  // center_sel = (opcode >> 29) & 3, the polygons clipped against
+  // clip_plane[center_sel] and projected about center[center_sel], the four
+  // read from the window command's words 2-5. R641 measured attract only,
+  // where every object uses centre 0; in a race the mini-map, the CONDITION
+  // panel and the rev needle use centre 1, which Daytona sets 46 rows below
+  // centre 0 -- so they were drawn 46 rows low (R703, R723). win_c0 now
+  // carries the selected centre for each object; m2_geo_view is unchanged.
+  logic [23:0] win_cen [4];              // {x[27:16], y[11:0]} of each centre
+  logic [1:0]  w_csel;                   // this opcode's centre select
+  logic [3:0]  w_win;                    // R889: windows opened so far this walk
+  logic        pd_tex;                   // R222: this transfer is texture data
+  logic [15:0] pd_n, pd_i;               // dwords to copy, and the one in hand
+  logic  [4:0] tp_i;                     // texture_parameters index, wraps at 32
+  logic [15:0] tp_n, tp_c;
+  logic [15:0] nops_f;                   // R255: nops decoded in the frame being walked
+  localparam logic [2:0] CAP_MTX = 3'd1, CAP_FOC = 3'd2, CAP_OBJ = 3'd3,
+                         CAP_TRA = 3'd4, CAP_LIT = 3'd5, CAP_ZAD = 3'd6,   // R246
+                         CAP_WIN = 3'd7,                                   // R642
+                         CAP_LOD = 3'd0;                                   // R905
+
+  assign mtx0 = mtx[0]; assign mtx4 = mtx[4]; assign mtx8 = mtx[8]; assign mtx11 = mtx[11];
+
+  assign dbg_walk_state = 4'(wst);
+
+  assign mat_we   = (wst == W_OPRD) && rd_go
+                 && ((w_cap == CAP_MTX) || (w_cap == CAP_TRA));
+  assign mat_idx  = (w_cap == CAP_TRA) ? (w_ci + 4'd9) : w_ci;
+  assign mat_data = rd_data;
+
+  wire is_mtx = (w_op == 5'h0b) || (w_op == 5'h1b);
+  wire is_foc = (w_op == 5'h09) || (w_op == 5'h19);
+  wire is_obj = (w_op == 5'h01) || (w_op == 5'h11);
+  // GEO_TRANSLATE_WRITE IS A MATRIX WRITE OF THE LAST ROW ONLY.
+  //
+  //     for (i = 0; i < 3; i++) geo->matrix[i+9] = u2f(*input++);
+  //
+  // matrix[9..11] is the TRANSLATION. A game that sets the rotation once with
+  // 0x0b and then moves an object with 0x0c would, while this was a blind
+  // skip, draw every object at whichever position the last full matrix write
+  // happened to leave -- geometry that is the right shape in the wrong place,
+  // which is far harder to recognise as a missing opcode than a blank screen.
+  wire is_tra = (w_op == 5'h0c) || (w_op == 5'h1c);
+  wire is_lit = (w_op == 5'h0a) || (w_op == 5'h1a);
+  // R246: zsort_mode. Its one operand is the z-sort bias -- the reference
+  // stores (operand >> 8) << 8 and then uses only bits 30:23 of it -- and this
+  // walker used to step over it.
+  wire is_zad = (w_op == 5'h08) || (w_op == 5'h18);
+  wire is_tp  = (w_op == 5'h06);                     // texture_parameters
+  wire is_win = (w_op == 5'h03) || (w_op == 5'h13);  // R642: window_data
+  wire is_lod = (w_op == 5'h16);                     // R905: geo_lod, one operand
+  wire [3:0] cap_last = (w_cap == CAP_MTX) ? 4'd11
+                      : (w_cap == CAP_FOC) ? 4'd1
+                      : (w_cap == CAP_TRA) ? 4'd2
+                      : (w_cap == CAP_LIT) ? 4'd2
+                      : (w_cap == CAP_ZAD) ? 4'd0
+                      : (w_cap == CAP_LOD) ? 4'd0      // R905
+                      : (w_cap == CAP_WIN) ? 4'd5      // R642: six words
+                                           : 4'd3;
+
+  // THE ACKNOWLEDGE IS TAKEN ON ITS RISING EDGE, AND THE REQUEST DROPS FOR
+  // ONE CYCLE AFTER EVERY WORD (R207). The board's port adapter holds its
+  // acknowledge for as long as the request stands, so a request held as a
+  // level across consecutive words -- which this was, with w_ip advancing on
+  // each acknowledge -- took the same held acknowledge again with the OLD
+  // data, and the port never issued the next read: the stream arrived one
+  // word ahead (oba received obc). Every requester on a shared port needs
+  // both rules; the boot bench's instant service never showed the want.
+  logic rd_ack_d, rd_go_d;
+  wire  rd_go;
+  assign rd_go = rd_ack & ~rd_ack_d;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin rd_ack_d <= 1'b0; rd_go_d <= 1'b0; end
+    else begin rd_ack_d <= rd_ack; rd_go_d <= rd_go; end
+  end
+  assign rd_req  = ~rd_go_d & ((wst == W_FETCH) || (wst == W_CNT) || (wst == W_DDATTR)
+                || (wst == W_OPRD) || (wst == W_PDA) || (wst == W_PDR)
+                || (wst == W_TPI)  || (wst == W_TPP) || (wst == W_TPC));
+  assign rd_addr = w_ip;
+  assign walk_started = walk_go && (wst == W_IDLE);   // R826
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      wst <= W_IDLE; w_ip <= 19'd0; w_ops <= 16'd0; w_skip <= 16'd0; w_op <= 5'd0;
+      walk_jumped <= 1'b0; w_start <= 19'd0;
+      dbg_walk_ops <= 16'd0; dbg_walk_objs <= 16'd0;
+      dbg_walk_frames <= 16'd0; dbg_walk_unknown <= 8'd0;
+      w_cap <= 3'd0; w_ci <= 4'd0; obj_valid <= 1'b0; eng_seen <= 1'b0;
+      frame_pend <= 1'b0; drain_wait <= 10'd0;
+      flip_pend <= 1'b0; fs_since_flip <= 3'd7; setrp_q <= 1'b0;
+      flip_seq <= 16'd0;   // R752
+      dbg_walk_flip <= 16'd0; dbg_walk_fallback <= 16'd0;
+      setwp_q <= 1'b0; wp_pend <= 1'b0; flip_seen <= 1'b0; skip_cnt <= 2'd0;   // R699
+      vbl_after_flip <= 1'b0;                                                   // R826
+      nd_pend <= 1'b0; nodraw <= 1'b0;                                          // R711
+      pd_addr <= 32'd0; pd_n <= 16'd0; pd_i <= 16'd0;
+      pd_req <= 1'b0; pd_wdata <= 32'd0;
+      dbg_pd_words <= 16'd0; dbg_pd_cmds <= 16'd0; dbg_td_words <= 16'd0; pd_tex <= 1'b0;
+      dbg_mtx_n <= 16'd0; dbg_foc_n <= 16'd0;
+      foc_x <= 32'd0; foc_y <= 32'd0;
+      lit_x <= 32'd0; lit_y <= 32'd0; lit_z <= 32'd0; dbg_lit_n <= 16'd0;
+      dbg_nops <= 16'd0; nops_f <= 16'd0;
+      zadj_e <= 8'd0;   // raster->z_adjust starts at zero in the reference
+      // R642: until the game sends one, the window MAME's first frame carries
+      // -- viewport (0,128)-(496,512), centre (248,320) -- which is exactly the
+      // projection this core used as constants (R174).
+      win_vp_s <= 32'h0000_0080; win_vp_e <= 32'h01F0_0200; win_c0 <= 32'h00F8_0140;
+      for (int k = 0; k < 4; k++) win_cen[k] <= 24'h0F8_140;   // R760
+      w_csel <= 2'd0;
+      win_cnt  <= 8'd0;
+      w_win <= 4'd0; obj_win <= 4'd0;   // R889
+      tp_i <= 5'd0; tp_n <= 16'd0; tp_c <= 16'd0; dbg_tp_n <= 16'd0;
+      tp_we <= 1'b0; tp_idx <= 5'd0; tp_diffuse <= 8'd0; tp_ambient <= 8'd0;
+      tc_we <= 1'b0; tc_l <= 12'd0; lod_l <= 12'h860;   // R905: 128.0, the old rule's lod
+      obj_tpa <= 32'd0; obj_tha <= 32'd0; obj_oba <= 32'd0; obj_obc <= 32'd0;
+      for (int k = 0; k < 12; k++) mtx[k] <= 32'd0;
+    end else begin
+      obj_valid <= 1'b0;
+      tc_we     <= 1'b0;   // R905: one cycle
+      // Remember the vblank; clear it when the walk actually starts.
+      if (frame_start && (flip_seen || setrp_q)) vbl_after_flip <= 1'b1;   // R826
+      if (frame_start) begin frame_pend <= 1'b1; drain_wait <= 10'd0;
+                             dbg_nops <= nops_f; nops_f <= 16'd0; end   // R255: latch per frame
+      // R638: the grace counts only while no walk runs. Counted during a walk,
+      // it had long expired when that walk ended, so the next walk started at
+      // once over its own list's tail still queued -- and then held it.
+      else if ((frame_pend || flip_pend) && !(&drain_wait) && (wst == W_IDLE))
+        drain_wait <= drain_wait + 10'd1;
+      // The flip. Counted like Model 1's fs_since_flip so the vblank fallback
+      // only applies to a list that has not flipped in four frames.
+      setrp_q <= wr_setrp;
+      setwp_q <= wr_setwp;
+      if (setrp_q) begin
+        fs_since_flip <= 3'd0;
+        // R699: only every (skip+1)th flip DRAWS; R711: every flip walks
+        flip_pend <= 1'b1; flip_seen <= 1'b1; drain_wait <= 10'd0;
+        flip_seq  <= push_seq;   // R752: every word pushed before this flip
+        if (skip_cnt >= ((skip == 2'd3) ? 2'd2 : skip)) begin
+          skip_cnt <= 2'd0; nd_pend <= 1'b0;
+        end else begin
+          skip_cnt <= skip_cnt + 2'd1; nd_pend <= 1'b1;
+        end
+      end
+      else if (frame_start && !no_flips) fs_since_flip <= fs_since_flip + 3'd1;
+      if (setwp_q) begin wp_pend <= 1'b1; drain_wait <= 10'd0; end
+      if (walk_go && (wst == W_IDLE)) begin
+        frame_pend <= 1'b0; flip_pend <= 1'b0; wp_pend <= 1'b0; flip_seen <= 1'b0;
+        vbl_after_flip <= 1'b0;   // R826
+        nodraw <= flip_pend && nd_pend;   // R711: a fallback walk always draws
+        nd_pend <= 1'b0;
+        // R263: the game's own list-ready write, or the vblank fallback.
+        if (flip_pend) begin
+          if (!(&dbg_walk_flip)) dbg_walk_flip <= dbg_walk_flip + 16'd1;
+        end else begin
+          if (!(&dbg_walk_fallback)) dbg_walk_fallback <= dbg_walk_fallback + 16'd1;
+        end
+      end
+      case (wst)
+        // THE WALK MUST NOT READ A BUFFER THE FRONT DOOR IS STILL WRITING.
+        //
+        // frame_start used to launch the walk immediately. The push DMA writes
+        // buffer RAM through the SHARED SDRAM WRITE PORT, which has real
+        // latency and a queue in front of it, so at vblank there can be words
+        // the i960 has written that have not reached memory. The walk then
+        // reads the previous frame's contents -- and a stale geo_end in dword 0
+        // terminates it instantly, which is precisely what the board reports:
+        //
+        //     rp=0000  wp=0024  frames=2821  matrix pushes=110  decoded=0
+        //
+        // identical pointers to simulation, which decodes 399 matrix writes
+        // from them. Same RTL, same addresses, different content at read time.
+        //
+        // NO BENCH HERE COULD SHOW IT. In simulation the queue drains in the
+        // same cycle it is filled and the DMA acknowledges immediately, so the
+        // race does not exist; on hardware it is the difference between a
+        // display list and the tail of the last one.
+        //
+        // So a frame_start is REMEMBERED and the walk begins when the queue is
+        // empty and the DMA idle. The timeout is not optional: a game pushing
+        // continuously would otherwise never start a walk at all, and dropping
+        // a frame is far better than dropping every frame.
+        W_IDLE: if (walk_go) begin
+          // MASKED TO 0x1ffff FIRST, THEN /4 -- geo_parse is
+          // `(m_geo_read_start_address & 0x1ffff)/4`, and the mask is not
+          // decoration: the register holds 20 bits, so an unmasked [19:2] can
+          // start the walk at up to 0x3FFFF, past the 0x8000-dword end of
+          // bufferram, and the walk bounds out having retired ONE opcode with
+          // no unknown to explain it. That is what the board reported --
+          // ops=1, objs=0, frames frozen, unknown clear.
+          w_ip  <= 19'(geo_rp[16:2]);       // the read pointer is a BYTE address
+          w_start <= 19'(geo_rp[16:2]);    // R854
+          walk_jumped <= 1'b0;             // R638
+          w_ops <= 16'd0;
+          w_win <= 4'd0;                   // R889: render_frame_start's cur_window = 0
+          wst   <= W_FETCH;
+        end
+        // FETCH AND WAIT ARE ONE STATE. Asserting the request and then moving on
+        // unconditionally drops an acknowledge that arrives in the same cycle,
+        // which a fast memory does -- the walk then never advances at all.
+        W_FETCH: if (rd_go) begin
+          // THE BOUND LIVES HERE, NOT ONLY IN W_SKIP. A jump re-enters W_FETCH
+          // without passing through W_SKIP, so a list of nothing but jumps was
+          // unbounded -- and unwritten memory is exactly that list: it reads
+          // 0xFFFFFFFF, bit 31 is set, so every word is a jump to the same
+          // address and the walk never leaves this state. MAME cannot hit this
+          // because it fills bufferram with 0x07800f0f (an `end`) at reset.
+          if (w_ops >= 16'h7fff) begin
+            dbg_walk_ops <= w_ops;
+            wst <= W_IDLE;
+          end else if (rd_data[31]) begin              // a jump
+            w_ip <= 19'(rd_data[16:2]);
+            walk_jumped <= 1'b1;                       // R638
+            wst  <= W_FETCH;
+          end else begin
+            w_op  <= rd_data[27:23];
+            w_csel <= rd_data[30:29];          // R760: center_sel
+            w_ip  <= w_ip + 19'd1;
+            wst   <= W_DECODE;
+          end
+          w_ops <= w_ops + 16'd1;
+        end
+        W_DECODE: begin
+          if (w_op[3:0] == 4'h1) dbg_walk_objs <= dbg_walk_objs + 16'd1;
+          if (w_op == 5'h00 && !(&nops_f)) nops_f <= nops_f + 16'd1;   // R255
+          if (is_end) begin
+            dbg_walk_ops    <= w_ops;
+            // the walk's end is the renderer's frame end (Model2.sv q3d_end);
+            // a skipped list's is not one (R711)
+            if (!nodraw) dbg_walk_frames <= dbg_walk_frames + 16'd1;
+            wst <= W_IDLE;
+          end else if (is_dd) begin
+            // tpa, tha and two xyz points, then the attribute loop.
+            w_skip <= 16'd8;
+            wst    <= W_DDSKIP;
+          end else if (is_test) begin
+            // Step the FIFO ramp first; W_CNT then lands on the block count.
+            w_skip <= 16'd32;
+            wst    <= W_TFIFO;
+          end else if (is_tp) begin
+            // Its first operand is the base index, so it is READ; W_CNT then
+            // lands on the entry count, as it does for polygon_data.
+            wst <= W_TPI;
+          end else if (is_pd || is_td) begin
+            // GEO_POLYGON_DATA IS EXECUTED, NOT STEPPED OVER, and it is the
+            // command the whole 3D path was waiting on. The board says
+            // Daytona's object_data points at SLOW POLYGON RAM and never at the
+            // polygon ROM -- objects rom=0, pram0=1 -- so without this the
+            // objects read unwritten memory, which is NaN, and nothing can
+            // draw. Its first operand is the destination address, so it is READ
+            // rather than skipped; W_CNT then lands on the count.
+            // R222: geo_texture_data takes the same road into texture RAM.
+            pd_tex <= is_td;
+            wst <= W_PDA;
+          end else if (is_var) begin
+            // code_upload's count IS the first operand; the others have one
+            // operand before it.
+            if (!is_cnt3) w_ip <= w_ip + 19'd1;
+            wst  <= W_CNT;
+          end else if (is_mtx || is_foc || is_obj || is_tra || is_lit || is_zad || is_win || is_lod) begin
+            // READ THESE OPERANDS RATHER THAN STEPPING OVER THEM. They carry
+            // the transform's state -- the matrix, its translation row, the
+            // projection, and the object's address and count. Everything else
+            // stays a blind skip, which is what kept the walk cheap while it
+            // was only counting.
+            w_cap <= is_mtx ? CAP_MTX : is_foc ? CAP_FOC
+                   : is_tra ? CAP_TRA : is_lit ? CAP_LIT
+                   : is_zad ? CAP_ZAD : is_win ? CAP_WIN : is_lod ? CAP_LOD : CAP_OBJ;   // R905
+            w_ci  <= 4'd0;
+            wst   <= W_OPRD;
+          end else if (oplen(w_op) == 16'hffff) begin
+            dbg_walk_unknown <= {3'd0, w_op};   // stop rather than desynchronise
+            dbg_walk_ops     <= w_ops;
+            wst <= W_IDLE;
+          end else begin
+            w_skip <= oplen(w_op);
+            wst    <= W_SKIP;
+          end
+        end
+        // One operand per acknowledge, straight into its destination. The
+        // reference reads each of these as a flat run of words in order
+        // (geo_matrix_write, geo_focal_distance, geo_object_data), so there is
+        // no reordering to get wrong here -- only the count.
+        W_OPRD: if (rd_go) begin
+          case (w_cap)
+            CAP_MTX: mtx[w_ci] <= rd_data;
+            CAP_TRA: mtx[w_ci + 4'd9] <= rd_data;
+            CAP_LIT: case (w_ci)
+                       4'd0: lit_x <= rd_data;
+                       4'd1: lit_y <= rd_data;
+                       default: lit_z <= rd_data;
+                     endcase
+            CAP_FOC: if (w_ci == 4'd0) foc_x <= rd_data; else foc_y <= rd_data;
+            CAP_ZAD: zadj_e <= rd_data[30:23];        // R246
+            CAP_LOD: lod_l  <= rd_data[30:19];        // R905
+            CAP_WIN: case (w_ci)                      // R642; R760: all four centres
+                       4'd0: win_vp_s <= rd_data;
+                       4'd1: win_vp_e <= rd_data;
+                       4'd2: win_cen[0] <= {rd_data[27:16], rd_data[11:0]};
+                       4'd3: win_cen[1] <= {rd_data[27:16], rd_data[11:0]};
+                       4'd4: win_cen[2] <= {rd_data[27:16], rd_data[11:0]};
+                       default: win_cen[3] <= {rd_data[27:16], rd_data[11:0]};
+                     endcase
+            default: case (w_ci)
+                       4'd0: obj_tpa <= rd_data;
+                       4'd1: obj_tha <= rd_data;
+                       4'd2: obj_oba <= rd_data;
+                       default: obj_obc <= rd_data;
+                     endcase
+          endcase
+          w_ip <= w_ip + 19'd1;
+          if (w_ci == cap_last) begin
+            if (w_cap == CAP_MTX) dbg_mtx_n <= dbg_mtx_n + 16'd1;
+            if (w_cap == CAP_FOC) dbg_foc_n <= dbg_foc_n + 16'd1;
+            if (w_cap == CAP_LIT) dbg_lit_n <= dbg_lit_n + 16'd1;
+            if (w_cap == CAP_WIN) win_cnt <= win_cnt + 8'd1;   // R642
+            if (w_cap == CAP_WIN && !(&w_win)) w_win <= w_win + 4'd1;   // R889
+            // The object is announced only once its four words are in, and
+            // the walk then STOPS until the engine reports the object drawn.
+            if (w_cap == CAP_OBJ && !nodraw) begin
+              obj_valid <= 1'b1;
+              // R760: this object's centre. The walk waits for the whole
+              // geometry (engine, projector, clipper) to go idle before the
+              // next object, so the view's few cycles of conversion are done
+              // long before this object's first vertex is projected.
+              win_c0    <= {4'd0, win_cen[w_csel][23:12], 4'd0, win_cen[w_csel][11:0]};
+              obj_win   <= w_win;          // R889
+              eng_seen  <= 1'b0;
+              wst       <= W_OBJW;
+            end else begin                 // R711: a skipped list's object goes nowhere
+              wst <= W_FETCH;
+            end
+          end else begin
+            w_ci <= w_ci + 4'd1;
+          end
+        end
+        // WAIT FOR THE ENGINE, IN TWO HALVES. busy rises the cycle AFTER
+        // start, so "wait until !busy" would fall straight through on the
+        // cycle obj_valid was raised and let the walk race ahead onto the
+        // port. Watch busy go up first, then come back down.
+        W_OBJW: begin
+          if (!eng_seen) begin
+            if (eng_busy) eng_seen <= 1'b1;
+          end else if (!eng_busy) begin
+            eng_seen <= 1'b0;
+            wst      <= W_FETCH;
+          end
+        end
+
+        W_CNT: if (rd_go) begin
+          // JUST THE COUNT. This state has already stepped past the count word
+          // itself, so adding one for it walks a word too far -- which lands on
+          // the operand AFTER the next command and desynchronises the whole
+          // list. It read as 1093 opcodes against an expected 101.
+          w_skip <= (is_cnt3 || is_test) ? (rd_data[15:0] * 16'd3)
+                  :  is_cnt2              ? (rd_data[15:0] * 16'd2)
+                                          :  rd_data[15:0];
+          w_ip   <= w_ip + 19'd1;
+          if (is_tp) begin
+            tp_n <= rd_data[15:0];
+            tp_c <= 16'd0;
+            dbg_tp_n <= dbg_tp_n + 16'd1;
+            wst  <= (rd_data[15:0] == 16'd0) ? W_FETCH : W_TPP;
+          end else if (is_pd || is_td) begin
+            pd_n   <= rd_data[15:0];
+            pd_i   <= 16'd0;
+            if (is_pd) dbg_pd_cmds <= dbg_pd_cmds + 16'd1;
+            // R222: texture data bound for LOG RAM (bit 23 clear) is stepped
+            // over by its count, as every 0x04 was before; w_skip is the count.
+            wst    <= (rd_data[15:0] == 16'd0) ? W_FETCH
+                    : (is_td && !pd_addr[23])  ? W_SKIP : W_PDR;
+          end else begin
+            wst    <= W_SKIP;
+          end
+        end
+
+        // THE BASE INDEX. MAME reads it as `index = (*input++) >> 2` -- a byte
+        // offset into a table of dwords -- and wraps it to 32 entries after
+        // each write.
+        W_TPI: if (rd_go) begin
+          tp_i <= rd_data[6:2];
+          w_ip <= w_ip + 19'd1;
+          wst  <= W_CNT;
+        end
+
+        // Each entry is TWO words: the packed parameters, then a coefficient
+        // this core does not use. diffuse and ambient are the low two bytes;
+        // specular_scale and specular_control are the high two and belong to
+        // the specular path, which does not exist yet.
+        W_TPP: if (rd_go) begin
+          tp_we      <= 1'b1;
+          tp_idx     <= tp_i;
+          tp_diffuse <= rd_data[7:0];
+          tp_ambient <= rd_data[15:8];
+          w_ip       <= w_ip + 19'd1;
+          wst        <= W_TPC;
+        end
+
+        // The coefficient word. R905: NOT the specular parser's -- MAME keeps
+        // it as coef_table[index], and every polygon's texture LOD is
+        // coef_table[attr >> 27] * |dotp| * lod. Streamed out as its log's
+        // twelve bits for m2_geometry's no-mip flag.
+        W_TPC: begin
+          tp_we <= 1'b0;
+          if (rd_go) begin
+            tc_we <= 1'b1;                  // R905: tp_idx still names this entry
+            tc_l  <= rd_data[30:19];
+            w_ip <= w_ip + 19'd1;
+            tp_i <= tp_i + 5'd1;            // wraps at 32, as `& 0x1f` does
+            if (tp_c == tp_n - 16'd1) wst <= W_FETCH;
+            else begin tp_c <= tp_c + 16'd1; wst <= W_TPP; end
+          end
+        end
+
+        // THE DESTINATION, DECODED AS geo_polygon_data DECODES IT: bit 24
+        // (0x01000000) selects fast polygon RAM, anything else slow. Note this
+        // is NOT geo_object_data's three-way decode -- polygon_data has no ROM
+        // case, because a ROM cannot be written.
+        W_PDA: if (rd_go) begin
+          pd_addr <= rd_data;
+          w_ip    <= w_ip + 19'd1;
+          wst     <= W_CNT;
+        end
+
+        // Read one dword of payload...
+        W_PDR: if (rd_go) begin
+          pd_wdata <= rd_data;
+          pd_req   <= 1'b1;
+          wst      <= W_PDW;
+        end
+
+        // ...and hand it to the write DMA. `pd_i` indexes from the destination
+        // and wraps inside the 32K-dword window, as MAME's `oba & 0x7fff` does
+        // for reads -- MAME's own pointer walks off the end of the array here,
+        // which is undefined behaviour we decline to reproduce.
+        W_PDW: begin
+          if (pd_ack) pd_req <= 1'b0;      // taken; do not offer it twice
+          if (pd_done) begin
+            pd_req <= 1'b0;
+            if (pd_tex) dbg_td_words <= dbg_td_words + 16'd1;
+            else        dbg_pd_words <= dbg_pd_words + 16'd1;
+            w_ip <= w_ip + 19'd1;
+            if (pd_i == pd_n - 16'd1) wst <= W_FETCH;
+            else begin pd_i <= pd_i + 16'd1; wst <= W_PDR; end
+          end
+        end
+        // The FIFO ramp: 32 words stepped without reading them. The ramp's
+        // CONTENTS are a hardware self-test the board has already passed by the
+        // time we see it; only its length matters here.
+        W_TFIFO: begin
+          if (w_skip == 16'd0) wst <= W_CNT;
+          else begin
+            w_ip   <= w_ip + 19'd1;
+            w_skip <= w_skip - 16'd1;
+          end
+          if (w_ip >= 19'h08000) begin
+            dbg_walk_ops <= w_ops;
+            wst <= W_IDLE;
+          end
+        end
+        // direct_data's loop. W_DDSKIP always returns to W_DDATTR, so the
+        // same pair serves both the fixed 8-word preamble and each vertex.
+        W_DDSKIP: begin
+          if (w_skip == 16'd0) wst <= W_DDATTR;
+          else begin
+            w_ip   <= w_ip + 19'd1;
+            w_skip <= w_skip - 16'd1;
+          end
+          if (w_ip >= 19'h08000) begin
+            dbg_walk_ops <= w_ops;
+            wst <= W_IDLE;
+          end
+        end
+        W_DDATTR: if (rd_go) begin
+          w_ip <= w_ip + 19'd1;               // the attribute is consumed either way
+          if ((rd_data[1:0] == 2'b00) || (w_ip >= 19'h08000)) begin
+            wst <= W_FETCH;                   // low two bits clear: list ends
+          end else begin
+            w_skip <= rd_data[0] ? 16'd8      // quad: luma, dist, xyz, xyz
+                                 : 16'd5;     // tri:  luma, dist, xyz
+            wst    <= W_DDSKIP;
+          end
+        end
+        W_SKIP: begin
+          if (w_skip == 16'd0) wst <= W_FETCH;
+          else begin
+            w_ip   <= w_ip + 19'd1;
+            w_skip <= w_skip - 16'd1;
+          end
+          // the walk is bounded: bufferram is 0x8000 dwords, and a runaway list
+          // must stop rather than read forever
+          if (w_ip >= 19'h08000 || w_ops >= 16'h7fff) begin
+            dbg_walk_ops <= w_ops;
+            wst <= W_IDLE;
+          end
+        end
+        default: wst <= W_IDLE;
+      endcase
+    end
+  end
+
+  // R608: THE OVERWRITE RACE, COUNTED. A pushed dword that drains into the
+  // walk's hold window while a walk runs replaces a word the walk may not have
+  // read. Counted as it drains to memory -- the moment it becomes visible to
+  // the walk. R638 lets words ahead of w_ip but beyond the window go (the other
+  // buffer), so this counts the window only; zero is the answer that matters.
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) dbg_overtake <= 16'd0;
+    else if (q_pop && (wst != W_IDLE) &&
+             ((LIST_WIN == 0) ? q_in_win : (q_in_lst && (walk_jumped || (q_dw >= w_ip)))))   // R854
+      dbg_overtake <= dbg_overtake + 16'd1;
+  end
+
+  assign walk_active = (wst != W_IDLE);   // R610
+
+endmodule

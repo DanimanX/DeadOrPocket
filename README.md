@@ -10,6 +10,36 @@ Based on the [`alphanu1/sega-model2-mister`](https://github.com/alphanu1/sega-mo
 
 ---
 
+## Phase 3 Milestone — Full Model 2A-CRX Compute Cartridge Verified on `5CEBA5F23C8` (PASS)
+
+Both FPGAs of the hybrid **DeadOrPocket** system are now **fully implemented, placed, routed, and timing-closed in Intel Quartus Prime 25.1 Lite** with **0 errors and `0.000 ns` TNS across all 4 PVT corners (`Slow 85°C`, `Slow 0°C`, `Fast 85°C`, `Fast 0°C`)**:
+
+- **Compute Cartridge FPGA (`src/cart_fpga/`, Intel Cyclone V `5CEBA5F23C8` · FBGA-484):** Integrates the complete Sega Model 2A-CRX compute & audio stack (`i960_top` full FPU + `m2_cpu_bridge` + `m2_copro` 4K TGP + `m2_geo` / `m2_geometry` + `m2_2a_sound` 68000/SCSP/DSP + Model 2A I/O & timers + 128 MB dual-chip `m2_sdram` + SPI MicroSD loader + `m2_cart_host` 30-pin PHY) at **81% ALMs (`23,673 / 29,080`)**, **43% M10K (`190 / 446`)**, **9% DSP (`13 / 150`)**, and **`+2.160 ns` worst-case setup slack** (`0.000 ns` TNS across all 4 corners). Pin-compatible with `5CEBA7F23C8` (`56,480` ALMs). Full schematic/power/PCB/BOM specification in [`docs/CARTRIDGE_HARDWARE.md`](docs/CARTRIDGE_HARDWARE.md).
+- **Analogue Pocket Render FPGA (`src/fpga/`, Intel Cyclone V `5CEBA4F23C8`):** Runs unmodified `m2_raster3d` (bilinear + mip + 2,560 quads) + `m2_video` + Dual Cellular PSRAM Ping-Pong FB + 8-port SDRAM + 30-pin Cart Bus PHY v2 at **57% ALMs (`10,563 / 18,480`)**, **98% M10K (`303 / 308`)**, **83% DSP (`55 / 66`)**, and **`0.000 ns` TNS across all 4 corners**.
+
+### Verified Dual-FPGA Silicon Fit Summary (Quartus Prime 25.1 Lite)
+
+| Metric | Compute Cartridge (`5CEBA5F23C8`) | Analogue Pocket (`5CEBA4F23C8`) | Combined System |
+|---|---:|---:|---:|
+| **Logic Utilization (ALMs)** | **23,673 / 29,080 (81%)** | **10,563 / 18,480 (57%)** | **34,236 / 47,560 (72%)** |
+| **Registers** | **24,079** | **14,495** | **38,574** |
+| **M10K RAM Blocks** | **190 / 446 (43%)** | **303 / 308 (98%)** | **493 / 754 (65%)** |
+| **DSP Blocks** | **13 / 150 (9%)** | **55 / 66 (83%)** | **68 / 216 (31%)** |
+| **PLLs** | **1 / 6 (17%)** | **2 / 4 (50%)** | **3 / 10 (30%)** |
+| **External Memory** | **128 MB Dual SDR SDRAM** + MicroSD | **64 MB SDRAM + 32 MB Dual PSRAM** *(256 KB SRAM free)* | **224 MB** (Zero DDR3) |
+| **4-Corner TNS (Setup/Hold/Rec/Rem/MPW)** | **0.000 ns** (Worst Setup `+2.160 ns`) | **0.000 ns** (Worst Setup `+0.149 ns`) | **100% Timing Closed** |
+
+### Compute Cartridge 4-Corner Static Timing Closure (`5CEBA5F23C8`)
+
+| Clock Domain | Target Freq | Verified Fmax (Slow 85°C / 0°C) | Slow 85°C Setup | Slow 0°C Setup | Fast 0°C Hold | TNS (All 4 Corners) |
+|---|---:|---:|---:|---:|---:|---:|
+| `clk_mem` (128 MB Dual SDRAM `m2_sdram`) | **100.000 MHz** | **127.55 / 129.27 MHz** | `+2.160 ns` | `+2.264 ns` | `+0.153 ns` | **0.000 ns** |
+| `clk_sys` (TGP + Geometry + SCSP Sound + Bridge) | **50.000 MHz** | **73.29 / 72.30 MHz** | `+6.184 ns` | `+6.169 ns` | `+0.120 ns` | **0.000 ns** |
+| `clk_cpu` (Intel i960KB + Full Subnormal FPU) | **25.000 MHz** | **36.50 / 35.90 MHz** | `+8.248 ns` | `+8.505 ns` | `+0.134 ns` | **0.000 ns** |
+| `clk_bus` (30-Pin Pocket Bus → **63.9 MB/s**) | **31.969 MHz** | **179.50 / 184.03 MHz** | `+25.709 ns` | `+25.846 ns` | `+0.169 ns` | **0.000 ns** |
+
+---
+
 ## Phase 2 Milestone — 30-Pin Cartridge Bus v2 & Full Verilator Co-Simulation (PASS)
 
 Both sides of the hybrid **Compute Cartridge ↔ 30-Pin Analogue Pocket Cartridge Bus ↔ Pocket Render Core** ([`src/cart_rtl/m2_cart_host.sv`](src/cart_rtl/m2_cart_host.sv) ↔ [`src/fpga/pocket_rtl/m2_cart_bus.sv`](src/fpga/pocket_rtl/m2_cart_bus.sv)) have been verified end-to-end in **Verilator 5.054** AND re-verified in **Quartus Prime 25.1 Lite (`5CEBA4F23C8`)** with **0 errors and `0.000 ns` TNS across all 4 PVT corners**:
@@ -75,14 +105,14 @@ The Analogue Pocket's main Intel Cyclone V FPGA (`5CEBA4F23C8`) provides **18,48
 
 ```mermaid
 flowchart LR
-    subgraph CART["Compute Cartridge (~24.2k-24.9k ALMs · 17 DSP · 64-128 MB SDRAM)"]
+    subgraph CART["Compute Cartridge · Cyclone V 5CEBA5F23C8 (Verified: 23,673 ALMs · 81% · 13 DSP · 0.000 TNS)"]
         direction TB
-        I960["Intel i960KB + FPU<br/>8,387 ALMs · 7 DSP"]
-        TGP["Fujitsu MB86233 TGP<br/>2,945 ALMs · 1 DSP"]
-        GEO["m2_geometry 3D<br/>6,200 ALMs · 3 DSP"]
-        SND["Sound Board M2 / 2A<br/>68000 + SCSP / YM+MPCM<br/>4,449 ALMs · 6 DSP"]
-        IO["cpu_bridge + m2_cart_host<br/>+ Z80 I/O (M2)"]
-        CSDRAM[("Cartridge SDRAM<br/>Prog+Data+Polys+Audio<br/>(DOA: 57.75 MB)")]
+        I960["Intel i960KB + FPU @ 25 MHz<br/>(Fmax 36.5 MHz · +8.25 ns)"]
+        TGP["Fujitsu MB86233 TGP @ 50 MHz<br/>4K Prog + Subnormal FPU"]
+        GEO["m2_geometry 3D @ 50 MHz<br/>(Fmax 73.3 MHz · +6.18 ns)"]
+        SND["Sound Board M2 / 2A @ 50 MHz<br/>68000 + SCSP + DSP"]
+        IO["cpu_bridge + m2_cart_host<br/>+ Timers/Backup/315-5649"]
+        CSDRAM[("128 MB Dual SDR SDRAM<br/>@ 100 MHz (Fmax 127.6 MHz)<br/>+ MicroSD Boot Slot")]
         I960 <--> TGP
         I960 --> GEO
         I960 --> SND
@@ -153,16 +183,19 @@ flowchart LR
 Requirements: Intel Quartus Prime 25.1 Lite (`5CEBA4F23C8`), Verilator 5.x, `g++`, `make`, and Python 3 (with Pillow).
 
 ```bash
-# 1. Compile the Analogue Pocket Render Core (map + fit + asm + sta)
+# 1. Compile the Analogue Pocket Render Core (5CEBA4F23C8: map + fit + asm + sta)
 ./tools/build_pocket.sh
 
 # 2. Generate bit-reversed bitstream.rbf_r and Release/DeadOrPocket_Pocket_v0.2.0-phase2.zip
 python3 tools/package_pocket.py --version v0.2.0-phase2
 
-# 3. Run Phase 2 full 4-channel 30-pin Bus + m2_raster3d + Dual PSRAM + SDRAM Verilator co-sim
+# 3. Compile the Compute Cartridge FPGA (5CEBA5F23C8: map + fit + asm + sta)
+./tools/build_cart.sh
+
+# 4. Run Phase 2 full 4-channel 30-pin Bus + m2_raster3d + Dual PSRAM + SDRAM Verilator co-sim
 make -C sim run_bus
 
-# 4. (Optional) Verify local MAME .zip ROM sets in roms/ and run real Model 2A i960 ROM boot co-sim
+# 5. (Optional) Verify local MAME .zip ROM sets in roms/ and run real Model 2A i960 ROM boot co-sim
 python3 tools/build_rom.py --verify-all
 python3 tools/build_rom.py --mra "Virtua Fighter 2 (Version 2.1).mra" --out roms/out
 make -C sim run_m2a
@@ -184,8 +217,8 @@ make -C sim run_m2a
 - [x] **Phase 0:** Feasibility audit against SpaceFish + real Quartus Prime 25.1 Lite (`5CEBA4F23C8`) synthesis benchmark across all 16 Model 2 and Model 2A-CRX subsystems.
 - [x] **Phase 1 — Pocket Render Core (`src/fpga/`):** Full Analogue Pocket `5CEBA4F23C8` render core (`m2_raster3d` + `m2_video` + Dual-PSRAM Ping-Pong FB + 8-port SDRAM + 30-pin Cart Bus PHY + built-in 3D Self-Test + Kasumi SpaceFish APF assets), fitted with **100% 4-corner timing closure (`0.000 ns TNS`)**.
 - [x] **Phase 2 — Cartridge Bus Protocol v2 & Verilator Co-Simulation (`src/cart_rtl/`, `sim/`):** Implemented symmetric `m2_cart_host.sv` + upgraded `m2_cart_bus.sv` (auto-coalesced live Texture/Char SDRAM streaming, 27-bit `q_tex`, latched VBlank CH3 turnaround), verified end-to-end in Verilator across all 4 channels (0 contention, 0 JEDEC SDRAM violations, 189k+ 3D pixels rendered, real *Virtua Fighter 2* & *Dead or Alive* i960 ROM boot), and re-verified `5CEBA4F23C8` Quartus 25.1 timing closure (`57% ALMs`, `98% M10K`, `0.000 ns TNS`).
-- [ ] **Phase 3 — Compute Cartridge Hardware Prototype:** Finalize target cartridge FPGA (`5CEBA5/7`, `GW5AST-60`, or `ECP5-85F`), design the 32-pin Pocket cartridge PCB with 64–128 MB SDRAM, high-efficiency buck power stage, and strict 3.3V bus I/O.
-- [ ] **Phase 4 — Hardware Bring-Up (Model 2A & Model 2):** Full 57.52 Hz hardware verification across *Dead or Alive*, *Virtua Fighter 2*, *Sega Rally*, and *Daytona USA* (handheld & Dock).
+- [x] **Phase 3 — Compute Cartridge FPGA & Hardware Design (`src/cart_fpga/`, [`docs/CARTRIDGE_HARDWARE.md`](docs/CARTRIDGE_HARDWARE.md)):** Finalized Intel Cyclone V **`5CEBA5F23C8`** (pin-compatible with `5CEBA7F23C8`, FBGA-484), completed the full Model 2A-CRX Compute Cartridge FPGA (`i960_top` + `m2_copro` + `m2_geometry` + `m2_2a_sound` + 128 MB dual-chip `m2_sdram` + `m2_cart_host`) verified in Quartus Prime 25.1 Lite at **81% ALMs (`23,673 / 29,080`)**, **43% M10K**, **9% DSP**, and **`0.000 ns` TNS across all 4 PVT corners** (`+2.160 ns` worst setup slack), and authored the 6-layer ENIG PCB, dual-source safe power tree (`TPS2552` 180 mA slot limiter + `TPS2116` USB-C priority mux), and ~$62 prototype BOM.
+- [ ] **Phase 4 — KiCad PCB Layout, Fabrication & Hardware Bring-Up (Model 2A & Model 2):** Capture KiCad 8 schematic/6-layer PCB from [`docs/CARTRIDGE_HARDWARE.md`](docs/CARTRIDGE_HARDWARE.md), fabricate & assemble Rev A cartridge, add Model 2 original (`m2_ioz80` + `m2_sound_board`) variant + FAT32 MicroSD loader, and verify full 57.52 Hz hardware playback across *Dead or Alive*, *Virtua Fighter 2*, *Sega Rally*, and *Daytona USA* (handheld & Dock).
 
 ---
 

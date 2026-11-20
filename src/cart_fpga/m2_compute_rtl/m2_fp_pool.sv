@@ -1,0 +1,372 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Sega Model 2 core for MiSTer FPGA
+// Copyright (C) 2026 alphanu1
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the Free
+// Software Foundation, either version 3 of the License, or (at your option)
+// any later version. See LICENSE for the full text.
+//
+// PORTED FROM THE MODEL 1 CORE, m1_fp_pool.sv @ 78481c420327; re-taken
+// at 0b5d04f (R566) for the registered operand mux, the rotated arbiter and
+// the divider grant mask.
+// Same author, same licence, same arithmetic. See THIRD_PARTY.md.
+//
+// Taken rather than rewritten because Model 1 already made and rejected the
+// design this project reached for first: a private multiplier and adder inside
+// the transform stage. The header below is its own reasoning, and it applies
+// here unchanged -- Model 2 has the same fp_mul and fp_add, the same four-stage
+// pipelines, and a geometry record of the same shape.
+//
+// One multiplier, one adder and one divider, shared by every geometry stage.
+//
+// WHY SHARED, AND THE ARITHMETIC THAT SAYS IT COSTS NOTHING
+//
+// The stages were first built with private units - m2_geo_xform with a multiplier
+// and an adder, m2_geo_project with both plus a divider, m2_geo_det with both
+// again - which is three of each. Counting what a polygon record actually needs:
+//
+//     transform   3 points x (9 mul, 8-9 add)   27 mul   24 add
+//     determinant                                9 mul   11 add
+//     projection  2 points x (4 mul, 4 add)      8 mul    8 add   2 div
+//                                               --------------------------
+//                                               44 mul   43 add   2 div
+//
+// against a budget of 68 cycles a record (docs/findings.md). fp_mul and fp_add
+// are four-stage pipelines that retire one result per cycle, so ONE of each runs
+// at 65% and 63%. Three of each buys nothing at all; it was convenience, not
+// necessity, and it costs two multipliers and two adders.
+//
+// The divider is the exception and cannot be shared away: fp_div is 29 cycles and
+// does not pipeline, so two reciprocals a record is 58 of the 68 on their own.
+// Sharing it changes nothing because there was only ever one.
+//
+// ROUND ROBIN, NOT PRIORITY. At 65% utilisation a fixed priority would almost
+// always be fine, and "almost always" is how a stage that is starved only on the
+// busiest frames gets shipped. The rotating pointer costs a handful of LUTs.
+//
+// RESULTS ARE ROUTED BY A TAG PIPELINE. fp_mul and fp_add have a fixed four-cycle
+// latency and retire in issue order, so the client index shifts through a
+// four-deep register alongside the operands and selects which client's response
+// line is raised. The divider holds a single tag, because only one division can
+// be outstanding.
+//
+// Each client has SEPARATE multiply and add ports rather than one operation port.
+// A stage frequently has a multiply and an add in flight at once - that is the
+// whole point of the pipelines - and a single port would serialise them for no
+// reason, then need a queue to sort the two results out again.
+
+`timescale 1ns/1ps
+
+module m2_fp_pool #(
+  parameter int unsigned NC = 3,         // clients
+  // R740: the adder's mid-stage register (fp_add PIPE_A2) -- the add latency
+  // is 6 with it, and m2_geo_xform's FP_ADD_LAT must say so (its default does).
+  parameter bit          ADD_A2 = 1'b1
+) (
+  input  logic                clk,
+  input  logic                rst_n,
+
+  // ---- multiply
+  input  logic [NC-1:0]       mul_req,
+  input  logic [31:0]         mul_a   [NC],
+  input  logic [31:0]         mul_b   [NC],
+  output logic [NC-1:0]       mul_gnt,
+  output logic [NC-1:0]       mul_rsp,
+  output logic [31:0]         mul_res,
+
+  // ---- add / subtract
+  input  logic [NC-1:0]       add_req,
+  input  logic [31:0]         add_a   [NC],
+  input  logic [31:0]         add_b   [NC],
+  input  logic [NC-1:0]       add_sub,
+  output logic [NC-1:0]       add_gnt,
+  output logic [NC-1:0]       add_rsp,
+  output logic [31:0]         add_res,
+
+  // ---- divide
+  input  logic [NC-1:0]       div_req,
+  input  logic [31:0]         div_a   [NC],
+  input  logic [31:0]         div_b   [NC],
+  output logic [NC-1:0]       div_gnt,
+  output logic [NC-1:0]       div_rsp,
+  output logic [31:0]         div_res
+);
+
+  localparam int unsigned CW   = (NC > 1) ? $clog2(NC) : 1;
+  localparam int unsigned SUMW = CW + 1;
+
+  // ------------------------------------------------------------- arbiters
+  // Rotating pointer: the client after the last winner gets first refusal.
+  logic [CW-1:0] mul_rr, add_rr, div_rr;
+
+  // The winner is chosen with a plain priority chain over a ROTATED request
+  // vector, walked from the last index down so the lowest rotated index wins.
+  // No loop-with-break: yosys rejects it (docs/rtl-conventions.md).
+  // ROTATE THE REQUEST VECTOR ONCE, THEN PRIORITISE ON CONSTANTS.
+  //
+  // The obvious way to walk a rotated vector is to compute the rotated index
+  // inside the loop and read `req[idx]`. That is what stood here, and it is
+  // quadratic: the loop is unrolled NC times, `idx` is a VARIABLE in every one
+  // of them, so each iteration builds its own NC:1 mux to read `req[idx]` on
+  // top of its own add, compare and conditional subtract. NC of those per
+  // arbiter, and there are THREE arbiters (multiply, add, divide).
+  //
+  // Rotating first collapses it. `{req, req} >> first` is a single barrel
+  // shifter whose bit k is `req[(first + k) % NC]`, so the priority chain that
+  // follows indexes with k CONSTANT - no mux at all, just a chain of CW-bit
+  // selects - and the wrap arithmetic happens ONCE on the winner instead of NC
+  // times on every candidate.
+  //
+  // One barrel shifter plus one adder per arbiter, against NC muxes plus NC
+  // adders plus NC subtractors. The behaviour is identical: same rotation, same
+  // priority order, same fallback to `first` when nothing is requesting.
+  //
+  // No loop-with-break here either - yosys rejects it, see
+  // docs/rtl-conventions.md - so the chain still walks DOWN from NC-1 and lets
+  // the lowest rotated index win by writing last.
+  function automatic [CW-1:0] rr_pick(input logic [NC-1:0] req, input logic [CW-1:0] first);
+    logic [2*NC-1:0] dbl;
+    logic [NC-1:0]   rot;
+    logic [CW-1:0]   best_k;
+    logic [CW:0]     sum;
+    logic            found;
+
+    dbl    = {req, req};
+    rot    = dbl[first +: NC];
+    best_k = '0;
+    found  = 1'b0;
+    for (int k = NC - 1; k >= 0; k--) begin
+      if (rot[k]) begin
+        best_k = CW'(k);
+        found  = 1'b1;
+      end
+    end
+    // A CONDITIONAL SUBTRACT, NOT A MODULO. `first` and `best_k` are both
+    // 0..NC-1, so the sum never exceeds 2*NC-2 and one subtract wraps it
+    // exactly. `% NC` with a non-constant operand synthesises a divider.
+    sum     = {1'b0, first} + {1'b0, best_k};
+    rr_pick = found ? ((sum >= SUMW'(NC)) ? CW'(sum - SUMW'(NC)) : CW'(sum))
+                    : first;
+  endfunction
+
+  // R959: mul_win AND add_win FROM A ONE-HOT, NOT FROM rr_pick. rr_pick is a
+  // rotate, a priority chain, an add and a conditional subtract, and its index
+  // then selects the 32-bit operands: m2_geo_clip cs -> its mul_req -> rr_pick
+  // -> mul_b[mul_win] -> mul_b_q was the failing clk_sys path on the Model 2
+  // build (s1488 -0.395), and near it on 2A (cp_a -> mul_a_q, s1479 -0.021).
+  // rr_pick's answer said as a one-hot (rr_oh): the lowest requester at or
+  // above the pointer, else the lowest requester, else the pointer itself --
+  // its masks a decode of the pointer REGISTER, beside the requests rather
+  // than behind them -- then encoded (one level) into the same index. The
+  // operand mux, the grants, the tags and the pointer are unchanged and read
+  // it as before. rr_pick stays for the divider, off these paths.
+  // Identical by construction; sim/miter/pool_eq.sh proves it.
+  function automatic [NC-1:0] rr_oh(input logic [NC-1:0] req, input logic [CW-1:0] first);
+    logic [NC-1:0] ge, hi, f1;
+    for (int k = 0; k < NC; k++) begin
+      ge[k] = CW'(k) >= first;
+      f1[k] = CW'(k) == first;
+    end
+    hi = req & ge;
+    rr_oh = (|hi)  ? (hi  & (~hi  + NC'(1))) :
+            (|req) ? (req & (~req + NC'(1))) : f1;
+  endfunction
+  function automatic [CW-1:0] oh_idx(input logic [NC-1:0] oh);
+    oh_idx = '0;
+    for (int k = 0; k < NC; k++) if (oh[k]) oh_idx = oh_idx | CW'(k);
+  endfunction
+  wire [CW-1:0] mul_win = oh_idx(rr_oh(mul_req, mul_rr));
+  wire [CW-1:0] add_win = oh_idx(rr_oh(add_req, add_rr));
+  // A CLIENT IS MASKED FOR ONE CYCLE AFTER ITS GRANT.
+  //
+  // Grants here are combinational, and a client's "I have been granted" flag is
+  // necessarily REGISTERED - it cannot see the grant until the next edge - so
+  // its request is still asserted on the grant cycle itself. With a single
+  // divider that costs nothing, because the divider is then busy for up to 29
+  // cycles and the stale request cannot win again. The moment a SECOND divider
+  // exists the other one is free, the stale request wins immediately, and every
+  // division is issued twice.
+  //
+  // That is exactly what happened when a second divider was tried on
+  // 2026-09-04: it made the board worse and was reverted, and the cause was
+  // read as the extra divider rather than as this hazard. It is not the
+  // client's bug to fix either - gating m2_geo_project's div_req on div_gnt
+  // closes a combinational loop through the arbiter.
+  //
+  // Masking here costs NC flops and no throughput: clients are single
+  // outstanding, so none of them can legitimately want a grant on two
+  // consecutive cycles.
+  logic [NC-1:0] div_gnt_d;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) div_gnt_d <= '0;
+    else        div_gnt_d <= div_gnt;
+  end
+  wire [NC-1:0] div_elig = div_req & ~div_gnt_d;
+
+  wire [CW-1:0] div_win = rr_pick(div_elig, div_rr);
+
+  wire mul_any /* verilator public_flat_rd */ = |mul_req;
+  wire add_any /* verilator public_flat_rd */ = |add_req;
+  wire div_any = |div_elig;
+
+  // ------------------------------------------------------------- units
+  logic        m_valid, a_valid, d_valid;
+  logic [31:0] m_res, a_res, d_res;
+  logic        d_busy;
+  logic        m_ovf, m_unf, m_inv, a_ovf, a_unf, a_inv;
+  logic        d_ovf, d_unf, d_dz, d_inv;
+
+  logic        div_issue;
+  assign div_issue = div_any && !d_busy && !div_outstanding;
+  logic        div_outstanding;
+
+  // OPERAND MUX REGISTERED, BECAUSE IT WAS THE clk_3d CRITICAL PATH.
+  // m2_geometry's worst path ran
+  //   m2_fp_pool|add_rr[1] -> m2_fp_pool|fp_add:u_add|sA_sticky
+  // the round-robin arbiter, through the NC-way 32-bit operand mux
+  // add_a[add_win], into fp_add's first stage, all in one cycle. The units
+  // themselves are fast -- fp_add 138.48 MHz standalone, fp_mul 145.62,
+  // fp_div 117.81 -- so the sharing wrapper was the limit, not the arithmetic.
+  //
+  // A cycle here buys clk_3d headroom, and clk_3d is tied to exactly 2x clk_cpu
+  // so the crossing stays a clock enable. That makes this the gate on the CPU
+  // clock as well, which is what the VR slowdowns are: ~70% of the real board's
+  // work per frame at 23.529 MHz.
+  //
+  // THE LATENCY IS NOW 5, NOT 4, AND m2_geo_xform MUST BE TOLD. It schedules
+  // its adds statically and derives the spacing from FP_ADD_LAT; every other
+  // consumer waits on *_rsp and does not care. See docs/findings.md.
+  //
+  // div is untouched: it issues only when !d_busy and holds div_outstanding for
+  // the whole iteration, so its mux is not on a per-cycle path.
+  logic        add_v_q, mul_v_q, div_v_q;
+  logic [31:0] add_a_q, add_b_q, mul_a_q, mul_b_q, div_a_q, div_b_q;
+  logic        add_sub_q;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      add_v_q <= 1'b0; mul_v_q <= 1'b0; div_v_q <= 1'b0; add_sub_q <= 1'b0;
+      add_a_q <= '0; add_b_q <= '0; mul_a_q <= '0; mul_b_q <= '0;
+      div_a_q <= '0; div_b_q <= '0;
+    end else begin
+      add_v_q   <= add_any;
+      add_a_q   <= add_a[add_win];
+      add_b_q   <= add_b[add_win];
+      add_sub_q <= add_sub[add_win];
+      mul_v_q   <= mul_any;
+      mul_a_q   <= mul_a[mul_win];
+      mul_b_q   <= mul_b[mul_win];
+      // DIV TOO, AND IT NEEDS NO TAG CHANGE. Once add and mul were registered
+      // the top path became div_rr[1] -> fp_div:u_div|q_exp[10] -- the same
+      // arbiter-through-operand-mux shape.
+      //
+      // Unlike add and mul, div is single-outstanding and self-timed: dtag is
+      // ONE register held for the whole iteration, not a shift pipeline, so
+      // there is no depth to re-tune. div_outstanding is set at div_issue,
+      // which is still a cycle before fp_div sees in_valid, and it is what
+      // blocks re-issue in that window -- so d_busy arriving a cycle later
+      // cannot cause a double issue.
+      //
+      // No consumer can be latency-sensitive to this either: fp_div is
+      // iterative with VARIABLE latency, so everything already waits on
+      // div_rsp. That is why the add/mul change left geo_rsqrt untouched.
+      div_v_q   <= div_issue;
+      div_a_q   <= div_a[div_win];
+      div_b_q   <= div_b[div_win];
+    end
+  end
+
+  fp_mul u_mul (
+    .clk(clk), .rst_n(rst_n),
+    .in_valid(mul_v_q), .a(mul_a_q), .b(mul_b_q),
+    .out_valid(m_valid), .result(m_res),
+    .overflow(m_ovf), .underflow(m_unf), .invalid(m_inv)
+  );
+
+  fp_add #(.PIPE_A2(ADD_A2)) u_add (
+    .clk(clk), .rst_n(rst_n),
+    .in_valid(add_v_q), .a(add_a_q), .b(add_b_q),
+    .sub(add_sub_q),
+    .out_valid(a_valid), .result(a_res),
+    .overflow(a_ovf), .underflow(a_unf), .invalid(a_inv)
+  );
+
+  fp_div u_div (
+    .clk(clk), .rst_n(rst_n),
+    .in_valid(div_v_q), .a(div_a_q), .b(div_b_q),
+    .busy(d_busy), .out_valid(d_valid), .result(d_res),
+    .overflow(d_ovf), .underflow(d_unf), .div_by_zero(d_dz), .invalid(d_inv)
+  );
+
+  wire unused_flags = &{1'b0, m_ovf, m_unf, m_inv, a_ovf, a_unf, a_inv,
+                        d_ovf, d_unf, d_dz, d_inv};
+
+  // ------------------------------------------------------------- grants
+  // A grant is combinational and means "accepted this cycle" - the pipelines
+  // always accept, so the only client that can be refused is one that lost the
+  // arbitration.
+  always_comb begin
+    mul_gnt = '0;
+    add_gnt = '0;
+    div_gnt = '0;
+    if (mul_any) mul_gnt[mul_win] = 1'b1;
+    if (add_any) add_gnt[add_win] = 1'b1;
+    if (div_issue) div_gnt[div_win] = 1'b1;
+  end
+
+  // ------------------------------------------------------------- tag pipelines
+  // FIVE DEEP, NOT FOUR: the operand register above added a stage ahead of the
+  // units, so a tag travels one more cycle before its result appears.
+  logic [CW-1:0] mtag [5];
+  logic [4:0]    mtag_v;
+  // R740: SIX for the add when ADD_A2 -- the tag must travel as long as fp_add.
+  localparam int AD = ADD_A2 ? 6 : 5;
+  logic [CW-1:0] atag [AD];
+  logic [AD-1:0] atag_v;
+  logic [CW-1:0] dtag;
+
+  assign mul_res = m_res;
+  assign add_res = a_res;
+  assign div_res = d_res;
+
+  always_comb begin
+    mul_rsp = '0;
+    add_rsp = '0;
+    div_rsp = '0;
+    if (m_valid && mtag_v[4]) mul_rsp[mtag[4]] = 1'b1;
+    if (a_valid && atag_v[AD-1]) add_rsp[atag[AD-1]] = 1'b1;
+    if (d_valid && div_outstanding) div_rsp[dtag] = 1'b1;
+  end
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      mul_rr <= '0; add_rr <= '0; div_rr <= '0;
+      mtag_v <= '0; atag_v <= '0; dtag <= '0;
+      div_outstanding <= 1'b0;
+      for (int i = 0; i < 5; i++) mtag[i] <= '0;
+      for (int i = 0; i < AD; i++) atag[i] <= '0;
+    end else begin
+      // Shift the tags along with the operands.
+      for (int i = 4; i > 0; i--) mtag[i] <= mtag[i-1];
+      for (int i = AD-1; i > 0; i--) atag[i] <= atag[i-1];
+      mtag_v <= {mtag_v[3:0], mul_any};
+      atag_v <= {atag_v[AD-2:0], add_any};
+      mtag[0] <= mul_win;
+      atag[0] <= add_win;
+
+      // Rotate past the winner so the next client gets first refusal.
+      if (mul_any) mul_rr <= (mul_win == CW'(NC-1)) ? '0 : mul_win + CW'(1);
+      if (add_any) add_rr <= (add_win == CW'(NC-1)) ? '0 : add_win + CW'(1);
+
+      if (div_issue) begin
+        dtag            <= div_win;
+        div_outstanding <= 1'b1;
+        div_rr          <= (div_win == CW'(NC-1)) ? '0 : div_win + CW'(1);
+      end else if (d_valid && div_outstanding) begin
+        div_outstanding <= 1'b0;
+      end
+    end
+  end
+
+endmodule
