@@ -185,7 +185,7 @@ The complete **Sega Model 2A-CRX Compute Cartridge FPGA** ([`src/cart_fpga/cart_
 The production-ready manufacturing package is available directly in the repository:
 - **Gerbers Archive (ZIP):** [`hardware/gerbers/DeadOrPocket_Cartridge_RevA_Gerbers.zip`](../hardware/gerbers/DeadOrPocket_Cartridge_RevA_Gerbers.zip)
 - **Release Mirror:** [`Release/DeadOrPocket_Cartridge_RevA_Gerbers.zip`](../Release/DeadOrPocket_Cartridge_RevA_Gerbers.zip)
-- **SHA256:** `908a05467146122d0ba7089db6e5b2a8ffa9fa7f5639c41438f94d23f9485026`
+- **SHA256:** `157a1a6619e8b1993b4c8e1c006a3834b7f68e111fc58795173add3bed8cebbb`
 
 ### Fabrication Parameters (JLCPCB / PCBWay)
 | Parameter | Required Value | Notes |

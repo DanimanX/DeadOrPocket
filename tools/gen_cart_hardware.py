@@ -215,8 +215,6 @@ def write_bom_and_cpl():
         w = csv.writer(f)
         w.writerow(["Designator", "Mid X", "Mid Y", "Layer", "Rotation"])
         for ref, val, fp, mpn, mfg, lcsc, qty, usd, layer, x, y, rot, notes in BOM:
-            if lcsc == "DNP":
-                continue
             w.writerow([ref, f"{x:.2f}mm", f"{y:.2f}mm", layer, rot])
     print(f"[OK] Wrote {cpl_path}")
 
