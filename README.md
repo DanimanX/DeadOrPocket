@@ -28,6 +28,11 @@ All **three complete FPGA bitstreams** of the hybrid **DeadOrPocket** system are
 <p align="center"><em>3D hardware render of the <strong>DeadOrPocket Compute Cartridge Rev A</strong> (57.5 × 76.0 mm 6-layer ENIG PCB): central Intel Cyclone V <code>5CEBA5F23C8N</code> (FBGA-484), dual 64 MB ISSI <code>IS42S16320F-6TL</code> SDRAMs, 3× buck power tree, side USB-C auxiliary power, 33 Ω series bus damping bank, and chamfered gold edge fingers.</em></p>
 
 <p align="center">
+  <img src="docs/pocket_cartridge_rear_3d.png" alt="DeadOrPocket Compute Cartridge inserted into Analogue Pocket (Rear 3D Render)" width="760">
+</p>
+<p align="center"><em>Rear 3D render of the <strong>DeadOrPocket Compute Cartridge</strong> inserted into an authentic matte-black Analogue Pocket console, enclosed in the 3D-printable shell ([<code>deadorpocket_cart_shell.scad</code>](hardware/shell/deadorpocket_cart_shell.scad)) with side auxiliary USB-C power port, MicroSD boot slot, and custom retro arcade label.</em></p>
+
+<p align="center">
   <img src="docs/cartridge_pcb_layout.svg" alt="DeadOrPocket Compute Cartridge 6-Layer ENIG PCB Floorplan" width="760">
 </p>
 

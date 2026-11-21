@@ -5,6 +5,10 @@
 <p align="center">
   <img src="cartridge_pcb_3d.png" alt="DeadOrPocket Compute Cartridge Rev A — 3D PCB Render" width="760">
 </p>
+<p align="center">
+  <img src="pocket_cartridge_rear_3d.png" alt="DeadOrPocket Compute Cartridge inserted into Analogue Pocket (Rear 3D Render)" width="760">
+</p>
+<p align="center"><em>Rear view of the 3D-printed compute cartridge (<a href="../hardware/shell/deadorpocket_cart_shell.scad"><code>deadorpocket_cart_shell.scad</code></a>) seamlessly inserted into the Analogue Pocket rear slot, showing the side USB-C auxiliary power port and MicroSD boot slot.</em></p>
 
 ![DeadOrPocket Compute Cartridge 6-Layer ENIG PCB Floorplan](cartridge_pcb_layout.svg)
 
