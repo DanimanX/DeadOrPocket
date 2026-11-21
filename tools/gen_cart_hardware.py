@@ -501,9 +501,12 @@ module half_shell(is_front = true) {
         // Side USB-C Auxiliary Power Cutout (Right side, y = 45 mm)
         translate([cart_w - wall - 1.0, 41.0, wall])
             cube([wall + 2.0, 9.6, 4.0]);
-        // Side MicroSD Card Slot Cutout (Left side, y = 62 mm)
+        // Side MicroSD Slot (Left side, y = 62 mm) — 100% Flush / Recessed design
+        // Card sits 0.5 mm recessed INSIDE shell with an ergonomic fingernail crescent notch
         translate([-1.0, 55.5, wall])
             cube([wall + 2.0, 14.0, 2.6]);
+        translate([0.5, 62.5, wall + 1.3])
+            cylinder(r = 5.0, h = 4.0, center = true, $fn = 24);
         // Recessed Tactile Reset Pinhole (Right side, y = 56 mm)
         translate([cart_w - wall - 1.0, 56.0, 3.0])
             rotate([0, 90, 0]) cylinder(h = wall + 2.0, d = 2.2);
