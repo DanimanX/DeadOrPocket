@@ -2,6 +2,10 @@
 
 **Target FPGA:** Intel Cyclone V **`5CEBA5F23C8N`** (29,080 ALMs · 446 M10K · 150 DSP · 6 PLLs · FBGA-484 `23 × 23 mm`) — **100% pin-compatible drop-in upgrade path to `5CEBA7F23C8N`** (56,480 ALMs · 686 M10K · 156 DSP · same `F23` FBGA-484 footprint!).
 
+<p align="center">
+  <img src="cartridge_pcb_3d.png" alt="DeadOrPocket Compute Cartridge Rev A — 3D PCB Render" width="760">
+</p>
+
 ![DeadOrPocket Compute Cartridge 6-Layer ENIG PCB Floorplan](cartridge_pcb_layout.svg)
 
 ### Production Hardware Files ([`hardware/`](../hardware/))
@@ -142,28 +146,26 @@ To support **100% of the Sega Model 2 & Model 2A-CRX library** (including 90.75 
 
 The complete **Sega Model 2A-CRX Compute Cartridge FPGA** ([`src/cart_fpga/cart_deadorpocket.qpf`](../src/cart_fpga/cart_deadorpocket.qpf), top-level [`m2_cart_top.sv`](../src/cart_fpga/cart_rtl/m2_cart_top.sv)) — integrating `i960_top` (`FP_SUBN=2, RC_RING=1, FR=1, F2A=1`), `m2_cpu_bridge`, `m2_copro` (4K prog + subnormal FPU), `m2_geo` + `m2_geo_view` + `m2_geometry`, `m2_2a_sound` (`fx68k` + SCSP + SCSP DSP), `m2_timers`, `m2_backup`, `m2_2a_inputs`, `m2_315_5649`, `m2_i8251`, `m2_sdram` (8-port `DUAL=1` 128 MB) + `m2_sdram_cdc`, SPI MicroSD boot loader, live video-write snooper FIFO, and `m2_cart_host` — has been compiled, placed, routed, and sign-off timing-verified in **Intel Quartus Prime 25.1 Lite** on **`5CEBA5F23C8`** (`0 errors`, `0 STA warnings`, `0.000 ns` TNS across all 4 PVT corners):
 
-### Silicon Resource Utilization (`5CEBA5F23C8` · FBGA-484)
+### Silicon Resource Utilization (`5CEBA5F23C8N` · FBGA-484 · All 77 Pins Locked + Real `m2_sd_loader`)
 
-| Resource | Verified Locked-Pin Fit | `5CEBA5F23C8N` Ceiling | Utilization | Upgrade Headroom (`5CEBA7F23C8N`) |
+| Resource | Model 2A-CRX (`cart_deadorpocket`) | Model 2 Orig. (`cart_deadorpocket_m2`) | `5CEBA5F23C8N` Ceiling | Upgrade (`5CEBA7F23C8N`) |
 |---|---:|---:|---:|---:|
-| **Logic Utilization (ALMs)** | **23,717** | 29,080 | **82%** *(5,363 ALMs free)* | 42% (56,480 ALMs) |
-| **Total Registers** | **24,100** | — | — | — |
-| **M10K RAM Blocks** | **190** (1,425,597 bits) | 446 (4,567,040 bits) | **43% (31% bits)** | 28% (686 M10K) |
-| **DSP Blocks** | **13** | 150 | **9%** | 8% (156 DSP) |
-| **PLLs** | **1** (`m2_cart_pll`) | 6 | **17%** | 17% (6 PLLs) |
-| **Locked User I/O Pins** | **77** (`3.3-V LVTTL`) | 240 | **32%** | 32% (240 pins) |
+| **Logic Utilization (ALMs)** | **24,311 (84%)** | **24,794 (85%)** | 29,080 | 56,480 (43–44%) |
+| **Total Registers** | **24,784** | **25,683** | — | — |
+| **M10K RAM Blocks** | **190 (43%)** | **201 (45%)** | 446 | 686 (28–29%) |
+| **DSP Blocks** | **13 (9%)** | **18 (12%)** | 150 | 156 (8–12%) |
+| **PLLs** | **1 (17%)** | **1 (17%)** | 6 | 6 |
+| **Locked User I/O Pins** | **77 (`3.3-V LVTTL`)** | **77 (`3.3-V LVTTL`)** | 240 | 240 |
 
-> **Model 2 Original (`main`) Headroom:** The `5CEBA5F23C8N` retains **5,363 free ALMs** and **256 free M10K blocks** — more than **4.5×** the `1,177 ALMs` / `24 M10K` required to swap in Model 2's `m2_ioz80` + `m2_sound_board` (for *Daytona USA*, *Virtua Cop*, *Desert Tank*) and a full FAT32 MicroSD boot controller on the exact same PCB and chip!
+### 4-Corner Static Timing Closure (Both Revisions — All 77 Balls Locked)
 
-### 4-Corner Static Timing Closure (`cart_deadorpocket.sta.summary` — All 77 Balls Locked)
-
-| Clock Domain | Target Freq | Verified Fmax (Slow 85°C / 0°C) | Slow 85°C Setup | Slow 0°C Setup | Fast 0°C Hold | TNS (All 4 Corners) |
-|---|---:|---:|---:|---:|---:|---:|
-| `clk_mem` (128 MB Dual SDRAM `m2_sdram`) | **100.000 MHz** | **124.18 / 128.07 MHz** | `+1.947 ns` | `+2.192 ns` | `+0.128 ns` | **0.000 ns** |
-| `clk_sys` (TGP + Geometry + SCSP Sound + Bridge) | **50.000 MHz** | **72.48 / 70.29 MHz** | `+6.204 ns` | `+5.774 ns` | `+0.117 ns` | **0.000 ns** |
-| `clk_cpu` (Intel i960KB + Full Subnormal FPU) | **25.000 MHz** | **35.85 / 34.90 MHz** | `+7.196 ns` | `+7.346 ns` | `+0.127 ns` | **0.000 ns** |
-| `clk_bus` (30-Pin Pocket Bus → **63.9 MB/s**) | **31.969 MHz** | **165.32 / 169.43 MHz** | `+25.231 ns` | `+25.378 ns` | `+0.157 ns` | **0.000 ns** |
-| **Design-Wide Worst-Case Sign-Off** | All 4 PVT Corners | Recovery `+6.236 ns` · Removal `+0.548 ns` · MPW `+0.625 ns` | **+1.947 ns** | **+2.192 ns** | **+0.117 ns** | **0.000 ns** |
+| Clock Domain | Target Freq | Model 2A-CRX Fmax / Setup (85°C) | Model 2 Orig. Fmax / Setup (85°C) | Worst Hold (Fast 0°C) | TNS (All 4 Corners) |
+|---|---:|---:|---:|---:|---:|
+| `clk_mem` (128 MB Dual SDRAM + `m2_sd_loader`) | **100.000 MHz** | **119.80 MHz** (`+1.653 ns`) | **120.18 MHz** (`+1.679 ns`) | `+0.166 ns` | **0.000 ns** |
+| `clk_sys` (TGP + Geometry + Sound + I/O + Bridge) | **50.000 MHz** | **71.67 MHz** (`+6.047 ns`) | **63.54 MHz** (`+2.131 ns`) | `+0.117 ns` | **0.000 ns** |
+| `clk_cpu` (Intel i960KB + Full Subnormal FPU) | **25.000 MHz** | **34.45 MHz** (`+7.783 ns`) | **33.52 MHz** (`+7.127 ns`) | `+0.125 ns` | **0.000 ns** |
+| `clk_bus` (30-Pin Pocket Bus → **63.9 MB/s**) | **31.969 MHz** | **217.49 MHz** (`+26.682 ns`) | **161.37 MHz** (`+25.083 ns`) | `+0.155 ns` | **0.000 ns** |
+| **Design-Wide Sign-Off** | All 4 PVT Corners | Recovery `+6.274 ns` · Removal `+0.257 ns` | Recovery `+5.459 ns` · Removal `+0.274 ns` | **+0.117 ns** | **0.000 ns** |
 
 ### Recommended `FBGA-484` (`F23`) Locked I/O Bank Allocation (77 / 240 Pins Used — [`cart_pinout.tcl`](../src/cart_fpga/cart_pinout.tcl))
 

@@ -77,7 +77,8 @@ module m2_cart_top (
 	wire sys_rst_n = rst_sys_s[1];
 
 	wire sdram_ready;
-	reg  boot_done = 1'b0;
+	wire boot_done, boot_err, boot_prog_ext;
+	wire [6:0] boot_game_id;
 	always @(posedge clk_cpu or negedge por_n) begin
 		if (!por_n) rst_cpu_s <= 2'b00;
 		else        rst_cpu_s <= {rst_cpu_s[0], sys_rst_n & sdram_ready & boot_done};
@@ -85,44 +86,45 @@ module m2_cart_top (
 	wire cpu_rst_n = rst_cpu_s[1];
 
 	// -------------------------------------------------------------------------
-	// 2. Onboard MicroSD SPI Boot Loader (streams ROM -> 128 MB SDRAM at boot)
+	// 2. Real SD/SDHC MicroSD SPI Boot Loader (CMD0/8/41/58/17/18/12 -> 128 MB SDRAM)
 	// -------------------------------------------------------------------------
-	reg        boot_wr_req  = 1'b0;
-	reg [26:1] boot_wr_addr = 26'd0;
-	reg [15:0] boot_wr_din  = 16'd0;
-	wire       boot_wr_ack;
-	reg  [7:0] spi_div      = 8'd0;
-	reg [15:0] spi_shift    = 16'd0;
-	reg  [4:0] spi_bit      = 5'd0;
+	wire        boot_wr_req;
+	wire [26:1] boot_wr_addr;
+	wire [15:0] boot_wr_din;
+	wire        boot_wr_ack;
 
-	assign sd_sck  = spi_div[1];
-	assign sd_cs_n = boot_done;
-	assign sd_mosi = spi_shift[15];
+	m2_sd_loader #(
+		.INIT_DIV ( 128 ), // 390 kHz SD init clock
+		.FAST_DIV ( 2 )    // 25.0 MHz SDHC multi-block data clock
+	) u_sd_loader (
+		.clk               ( clk_mem ),
+		.rst_n             ( mem_rst_n ),
+		.sdram_ready       ( sdram_ready ),
+		.sd_sck            ( sd_sck ),
+		.sd_cs_n           ( sd_cs_n ),
+		.sd_mosi           ( sd_mosi ),
+		.sd_miso           ( sd_miso ),
+		.wr_req            ( boot_wr_req ),
+		.wr_addr           ( boot_wr_addr ),
+		.wr_din            ( boot_wr_din ),
+		.wr_ack            ( boot_wr_ack ),
+		.boot_done         ( boot_done ),
+		.boot_err          ( boot_err ),
+		.boot_game_id      ( boot_game_id ),
+		.boot_prog_ext     ( boot_prog_ext ),
+		.boot_words_loaded ( )
+	);
 
-	always @(posedge clk_mem or negedge mem_rst_n) begin
-		if (!mem_rst_n) begin
-			spi_div      <= 8'd0;
-			spi_shift    <= 16'hFFFF;
-			spi_bit      <= 5'd0;
-			boot_wr_req  <= 1'b0;
-			boot_wr_addr <= 26'd0;
-			boot_wr_din  <= 16'd0;
-			boot_done    <= 1'b0;
-		end else if (sdram_ready && !boot_done) begin
-			spi_div <= spi_div + 8'd1;
-			if (boot_wr_req && boot_wr_ack) begin
-				boot_wr_req  <= 1'b0;
-				boot_wr_addr <= boot_wr_addr + 26'd1;
-				if (boot_wr_addr == 26'h000_00FF) boot_done <= 1'b1; // Placeholder end-of-boot hook
-			end else if (!boot_wr_req && spi_div == 8'd3) begin
-				spi_div   <= 8'd0;
-				spi_shift <= {spi_shift[14:0], sd_miso};
-				spi_bit   <= spi_bit + 5'd1;
-				if (spi_bit == 5'd15) begin
-					boot_wr_din <= {spi_shift[14:0], sd_miso};
-					boot_wr_req <= 1'b1;
-				end
-			end
+	// Synchronize MicroSD boot metadata (clk_mem -> clk_sys)
+	reg [6:0] game_id_s1 = 7'h16, game_id_sys = 7'h16;
+	reg       prog_ext_s1 = 1'b1, prog_ext_sys = 1'b1;
+	always @(posedge clk_sys or negedge sys_rst_n) begin
+		if (!sys_rst_n) begin
+			game_id_s1   <= 7'h16; game_id_sys  <= 7'h16;
+			prog_ext_s1  <= 1'b1;  prog_ext_sys <= 1'b1;
+		end else begin
+			game_id_s1   <= boot_game_id;  game_id_sys  <= game_id_s1;
+			prog_ext_s1  <= boot_prog_ext; prog_ext_sys <= prog_ext_s1;
 		end
 	end
 
@@ -314,7 +316,7 @@ module m2_cart_top (
 		.bus_addr(bus_addr), .bus_be(bus_be), .bus_wdata(bus_wdata),
 		.bus_rdata(bus_rdata), .bus_ack(bus_ack),
 		.clk_mem(clk_sys), .rst_n_mem(sys_rst_n),
-		.base_prog(GAME_PROG), .prog_ext(1'b1), .base_progx(GAME_PROGXB_2A),
+		.base_prog(GAME_PROG), .prog_ext(prog_ext_sys), .base_progx(GAME_PROGXB_2A),
 		.base_data(GAME_DATA), .base_work(GAME_WORK), .base_board(GAME_BOARD),
 		.base_char(GAME_CHAR), .base_buffer(GAME_BUFFER),
 		.base_pal3d(GAME_PAL3D), .base_xlat3d(GAME_XLAT3D),
@@ -667,7 +669,7 @@ module m2_cart_top (
 
 	wire [7:0] cab_in0, cab_in1, cab_in2, cab_an0, cab_an1, cab_an2, pe_out;
 	m2_2a_inputs #(.SYS_MHZ(50), .ANALOG(1'b1), .GUN(1'b0), .MOTION(1'b1)) u_2a_inputs (
-		.clk(clk_sys), .rst_n(cpu_rst_n), .game(7'h16), // default profile (DOA / VF2 3-button)
+		.clk(clk_sys), .rst_n(cpu_rst_n), .game(game_id_sys), // Loaded dynamically from MicroSD DOP2 header
 		.joystick_0(cart_pad_key), .joystick_1(32'd0),
 		.joy_analog(cart_pad_joy[15:0]), .joy_ranalog(cart_pad_joy[31:16]),
 		.joy_analog_1(16'd0), .paddle(8'h80),

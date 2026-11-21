@@ -65,9 +65,15 @@ M2A_CART_SV = \
 	$(M2_RTL)/m2_video_timing.sv \
 	tb_m2a_cart_top.sv
 
-.PHONY: all run_bus run_m2a clean
+.PHONY: all run_bus run_m2a run_sd clean
 
-all: run_bus
+all: run_bus run_sd
+
+obj_sd/Vtb_sd_loader: ../src/cart_fpga/cart_rtl/m2_sd_loader.sv tb_sd_loader.sv tb_sd_loader.cpp
+	$(VERILATOR) $(VFLAGS) --Mdir obj_sd --top-module tb_sd_loader ../src/cart_fpga/cart_rtl/m2_sd_loader.sv tb_sd_loader.sv tb_sd_loader.cpp
+
+run_sd: obj_sd/Vtb_sd_loader
+	./obj_sd/Vtb_sd_loader
 
 obj_bus/Vtb_hybrid_bus_top: $(BUS_SV) tb_hybrid_bus.cpp
 	mkdir -p out
@@ -86,4 +92,4 @@ run_m2a: obj_m2a/Vtb_m2a_cart_top
 	python3 -c "from PIL import Image; Image.open('out/vf2_boot_frame.ppm').save('out/vf2_boot_frame.png'); print('Saved out/vf2_boot_frame.png')"
 
 clean:
-	rm -rf obj_bus obj_m2a out
+	rm -rf obj_bus obj_m2a obj_sd out

@@ -1,0 +1,683 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Sega Model 2 core for MiSTer FPGA
+// Copyright (C) 2026 alphanu1
+//
+// The Model 1 sound board, which is what daytona93 has.
+//
+// model2.cpp instantiates SEGAM1AUDIO for model2o -- the same device model1.cpp
+// uses -- so this is a Model 1 board hanging off a Model 2 main board, talking
+// over the serial pair in m2_sound_link.sv and nothing else. Study §5.5 budgets
+// "SCSP + 68000" for sound, which is the wrong board for this game; see R87.
+//
+// THE MAP, read out of MAME's own address_map rather than transcribed from a
+// wiki. `manager.machine.devices[":m1audio:sndcpu"].spaces["program"].map`:
+//
+//   000000-03FFFF  ROM, 256 KB, region offset 0
+//   080000-09FFFF  ROM, 128 KB, region offset 0x20000 -- a WINDOW onto the same
+//                  image, not more ROM. The .mra loads 256 KB and that is all
+//                  there is; MAME's region is 768 KB because the device
+//                  allocates for the largest Model 1 game, not this one.
+//   C20000-C20003  i8251, the far end of the link that already carries the
+//                  right 48 bytes
+//   C40000-C40007  MULTIPCM 1        C50000  its sample bank
+//   C60000-C60007  MULTIPCM 2        C70000  its sample bank
+//   D00000-D00007  YM3438
+//   F00000-F0FFFF  RAM, 64 KB
+//
+// Everything is 16 bits and the 68000 addresses by byte, so UDSn/LDSn say which
+// half an access names. The devices are 8-bit and sit on the LOW half.
+//
+// THE ROM IS NOT HERE. It is 256 KB and it lives in SDRAM with the rest of the
+// image, so it is fetched over a request/acknowledge port and the board stalls
+// on DTACK until the word arrives. That keeps this module the same in
+// simulation, where the harness answers the port directly, and on hardware,
+// where the arbiter does -- and it means the CPU can be proven against MAME
+// before the arbiter grows a sixth channel.
+
+`timescale 1ns/1ps
+
+module m2_sound_board #(
+  // 48 MHz in, 10 MHz 68000 out (20 MHz crystal, divided by two). 48/10 is not
+  // an integer, so this is a phase accumulator rather than a counter: add
+  // TICK_NUM every cycle and pulse when it crosses TICK_DEN. The average is
+  // exact even though no individual period is, which is what a sound CPU needs
+  // -- a 4% error from rounding 4.8 down to 5 would put every tempo out.
+  // The two sound stages, switchable from the top so they can be turned on one
+  // at a time against the board rather than together. Both were written for
+  // real, measured faults and both were bypassed while a THIRD fault -- a port
+  // width mismatch in Model2.sv, R94 -- was making everything unlistenable.
+  parameter bit PCM_CACHE = 1'b1,          // per-voice sample line
+  parameter bit PCM_RATE  = 1'b1,          // headroom + fixed-rate drain
+  // R821: ONE MULTIPCM ENGINE FOR BOTH CHIPS (m2_multipcm_dual) in place of
+  // two m2_multipcm. Off: the board is exactly as it was -- same instances,
+  // same names, same logic. On: the same samples from the same register
+  // state (tb_m2_mpcm_dual), each chip still on its own fetcher and port.
+  parameter bit PCM_SHARED = 1'b0,
+  // R833: THE YM3438 AS A TIMER-ONLY STAND-IN (m2_ym_timers) in place of
+  // jt12. Daytona never voices the FM (R819, R833: MAME's ymsnd output is
+  // zero on both sound programs); the 68000 uses timer B and polls the busy
+  // and timer flags, which the stand-in reproduces clock for clock. Off: the
+  // board is exactly as it was. On: the FM is SILENT -- not for a game that
+  // keys the YM with a non-zero level.
+  parameter bit YM_STUB = 1'b0,
+  parameter int unsigned TICK_NUM = 20,     // 2 x 10 MHz: one enable per phase
+  parameter int unsigned TICK_DEN = 50,     // clk_sys
+  // R956 (R949's interpolator, on the Model 2 board): the 44,643 Hz output
+  // moved along the straight line between samples (m2_snd_lerp), so the
+  // framework's 48 kHz pickup -- its IIR filter off for room (R788) -- reads
+  // the line, not the step. Needs PCM_RATE (the drain's tick); 0: the steps.
+  parameter bit          LERP     = 1'b0
+) (
+  input  logic        clk,
+  input  logic        rst_n,
+
+  // ---- the serial link to the main board (B side)
+  input  logic  [7:0] rx_data,
+  input  logic        rx_valid,
+  output logic        rx_ack,
+  output logic  [7:0] tx_data,
+  output logic        tx_valid,
+  input  logic        tx_ack,
+
+  // ---- program ROM, wherever it lives
+  output logic        rom_req,
+  output logic [17:1] rom_addr,     // 256 KB, word addressed
+  input  logic        rom_ack,
+  input  logic [15:0] rom_data,
+
+  // ---- the two MULTIPCMs' sample fetches. Separate 4 MB maps, so separate
+  // ports: model2.cpp gives pcm1 and pcm2 their own regions and MAME's own
+  // region contents confirm the split -- pcm1 is mpr-16491+16492, pcm2 is
+  // mpr-16493+16494, contiguous, so first 4 MB and second 4 MB of the image.
+  // FOUR-WORD BURSTS, not bytes. Each chip fetches one byte at a time and the
+  // controller returns four words, so seven of every eight were being thrown
+  // away -- and the chip stalls its own slot counter while a fetch is
+  // outstanding, so that waste came straight off the sample rate. See
+  // m2_pcm_fetch.sv, which holds the burst.
+  output logic        pcm1_rom_req,  output logic [21:3] pcm1_rom_addr,
+  input  logic [63:0] pcm1_rom_data, input  logic        pcm1_rom_ack,
+  output logic        pcm2_rom_req,  output logic [21:3] pcm2_rom_addr,
+  input  logic [63:0] pcm2_rom_data, input  logic        pcm2_rom_ack,
+
+  // ---- the mix
+  output logic signed [15:0] snd_l,
+  output logic signed [15:0] snd_r,
+
+  // ---- for the debug channel
+  output logic [31:0] dbg_pc,
+  output logic [31:0] dbg_insns,
+  output logic [15:0] dbg_ym_writes,
+  output logic [15:0] dbg_pcm_writes,
+  // Cumulative output samples from the first MULTIPCM. Two readings a second
+  // apart give the rate directly, against the chip's own 44,643 Hz.
+  output logic [31:0] dbg_pcm_samples,
+  output logic [15:0] dbg_pcm_lat,
+  output logic [15:0] dbg_pcm_miss,
+  // Underruns say whether the headroom is enough; the level says how close the
+  // buffer runs to empty. Both are the question "is the rate stage working",
+  // which is not answerable from the average rate.
+  output logic [15:0] dbg_pcm_under,
+  output logic  [7:0] dbg_pcm_level
+);
+
+  // ----------------------------------------------------------- clock enables
+  logic [$clog2(TICK_DEN):0] acc;
+  logic phase;                 // 0 -> next enable is phi1, 1 -> phi2
+  logic enPhi1, enPhi2;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      acc <= '0; phase <= 1'b0; enPhi1 <= 1'b0; enPhi2 <= 1'b0;
+    end else begin
+      enPhi1 <= 1'b0;
+      enPhi2 <= 1'b0;
+      if (acc + TICK_NUM >= TICK_DEN) begin
+        acc <= acc + TICK_NUM - TICK_DEN;
+        phase <= ~phase;
+        if (phase) enPhi2 <= 1'b1;
+        else       enPhi1 <= 1'b1;
+      end else begin
+        acc <= acc + TICK_NUM;
+      end
+    end
+  end
+
+  // --------------------------------------------------------------- the 68000
+  wire        asn, ldsn, udsn, rwn;
+  wire [23:1] eab;
+  wire [15:0] oedb;
+  logic [15:0] iedb;
+  logic        dtackn;
+  logic  [2:0] ipl_n;
+  wire   [2:0] fc;
+
+  // AUTOVECTORED INTERRUPTS, WHICH MEANS VPA HAS TO BE ASSERTED.
+  //
+  // This was tied high, and the consequence is not subtle once seen. A 68000
+  // whose VPA never asserts runs a VECTORED acknowledge: it drives FC = 7,
+  // reads the low byte of the bus and uses it as a vector NUMBER. Nothing here
+  // answers an acknowledge cycle, so it read the unmapped default of 0xFF and
+  // jumped through vector 255 at 0x3FC -- into whatever happened to be there.
+  // The board then executed 0xFFFF, took the line-1111 exception at 0x2C, and
+  // looped: on hardware, 39.9 million bus cycles of it, never reading its UART.
+  //
+  // MAME's segam1audio raises this with set_input_line(M68K_IRQ_2), which is
+  // autovectored, so vector 26 at 0x68 is what the firmware has actually filled
+  // in. Assert VPA during the acknowledge and the 68000 takes it.
+  //
+  // It survived every simulation because the testbench never sent the board a
+  // byte: with rx_valid held at zero the RX interrupt never fired and this
+  // entire path was unreachable. The test now drives the link.
+  wire iack = as && (fc == 3'b111);
+  wire vpan = !iack;
+
+  fx68k u_cpu (
+    .clk(clk), .HALTn(1'b1),
+    .extReset(!rst_n), .pwrUp(!rst_n),
+    .enPhi1(enPhi1), .enPhi2(enPhi2),
+    .eRWn(rwn), .ASn(asn), .LDSn(ldsn), .UDSn(udsn),
+    .E(), .VMAn(),
+    .FC0(fc[0]), .FC1(fc[1]), .FC2(fc[2]),
+    .BGn(), .oRESETn(), .oHALTEDn(),
+    .DTACKn(dtackn), .VPAn(vpan), .BERRn(1'b1),
+    .BRn(1'b1), .BGACKn(1'b1),
+    .IPL0n(ipl_n[0]), .IPL1n(ipl_n[1]), .IPL2n(ipl_n[2]),
+    .iEdb(iedb), .oEdb(oedb), .eab(eab)
+  );
+
+  wire [23:0] addr  = {eab, 1'b0};
+  wire        as    = !asn;
+  wire        ds    = !ldsn || !udsn;
+  wire        we    = as && !rwn;
+  wire        rd    = as &&  rwn;
+
+  // --------------------------------------------------------------- decoding
+  // The ROM window at 0x080000 is the SAME 256 KB seen through a hole at offset
+  // 0x20000, not a second image. Both branches index one port.
+  wire sel_rom0 = as && (addr[23:18] == 6'b000000);              // 000000-03FFFF
+  wire sel_rom1 = as && (addr[23:17] == 7'b0000100);             // 080000-09FFFF
+  wire sel_rom  = sel_rom0 | sel_rom1;
+  wire sel_ram  = as && (addr[23:16] == 8'hF0);                  // F00000-F0FFFF
+  wire sel_uart = as && (addr[23:2]  == 22'h30_8000);            // C20000-C20003
+  wire sel_pcm1 = as && (addr[23:3]  == 21'h18_8000);            // C40000-C40007
+  wire sel_pcm2 = as && (addr[23:3]  == 21'h18_C000);            // C60000-C60007
+  wire sel_bnk1 = as && (addr[23:1]  == 23'h62_8000);            // C50000
+  wire sel_bnk2 = as && (addr[23:1]  == 23'h63_8000);            // C70000
+  wire sel_ym   = as && (addr[23:3]  == 21'h1A_0000);            // D00000-D00007
+
+  assign rom_addr = sel_rom1 ? {2'b01, addr[16:1]} : addr[17:1];
+
+  // ------------------------------------------------------------------- RAM
+  // 16 KB, NOT 64 (R412). The window is F00000-F0FFFF, but segam1audio.cpp says
+  // outright "real PCB actually has 2x 8kBx8-bit SRAMs (16kB total)", so the
+  // upper three quarters of that window ALIAS on the hardware. Model 1 measured
+  // it on this same board: tb_m1_sndboard counts the firmware touching
+  // ram_words = 8193, exactly 16 KB, and sized its own array at 8192.
+  //
+  // We were implementing the full 64 KB -- 64 M10K blocks for memory the
+  // machine does not have and the firmware never reaches. Dropping the top two
+  // address bits aliases exactly as the PCB does and frees 48 blocks, which is
+  // more of the device than the entire coprocessor uses.
+  //
+  // Byte lanes, tagged, never cleared in reset -- the standing rule.
+  (* ramstyle = "M10K" *) logic [7:0] ram_hi [8192];
+  (* ramstyle = "M10K" *) logic [7:0] ram_lo [8192];
+  logic [7:0] ram_hq, ram_lq;
+  wire [12:0] ram_a = addr[13:1];   // R412: aliases, as the real board does
+
+  always_ff @(posedge clk) begin
+    ram_hq <= ram_hi[ram_a];
+    ram_lq <= ram_lo[ram_a];
+    if (sel_ram && we && !udsn) ram_hi[ram_a] <= oedb[15:8];
+    if (sel_ram && we && !ldsn) ram_lo[ram_a] <= oedb[7:0];
+  end
+
+  // ------------------------------------------------------------------ UART
+  wire [7:0] uart_dout, uart_data_o, uart_stat_o;
+  wire       uart_irq, uart_irq_rx, uart_irq_tx;
+  // addr[1] picks data (0xC20000) from status/command (0xC20002), the same
+  // shape the i960's end has.
+  m2_i8251 u_uart (
+    .clk(clk), .rst_n(rst_n),
+    .sel(sel_uart && ds && (we || rwn)),
+    .we(we), .addr(addr[1]),
+    .din(oedb[7:0]),
+    .dout(uart_dout), .data_o(uart_data_o), .stat_o(uart_stat_o),
+    .tx_data(tx_data), .tx_valid(tx_valid), .tx_ack(tx_ack),
+    .rx_data(rx_data), .rx_valid(rx_valid), .rx_ack(rx_ack),
+    .irq(uart_irq), .irq_rx(uart_irq_rx), .irq_tx(uart_irq_tx)
+  );
+
+  // ---------------------------------------------------------------- IPL
+  // segam1audio wires the UART's rxrdy to the 68000's IRQ2, and NOTHING ELSE.
+  // R833: this note used to say the YM's timer went to IRQ4 and was missing
+  // here. MAME 0.289's segam1audio.cpp connects no YM interrupt, and the
+  // firmware does not need one: it polls the YM's status for timer B (bit 1,
+  // at 0x528-0x5C8) and busy (bit 7, before every write), MAME and this board
+  // alike. ym_irq_n stays unconnected, as in the reference.
+  always_comb begin
+    ipl_n = 3'b111;                       // no interrupt
+    if (uart_irq_rx) ipl_n = 3'b101;      // level 2, active low
+  end
+
+  // ------------------------------------------------------------- YM3438
+  //
+  // MAME's own figure, from -listxml: YM3438 OPN2C at 8,000,000 Hz. 48/8 is
+  // six exactly, so this is a counter and not the accumulator the 68000 needs.
+  //
+  // ONE WRITE PER BUS CYCLE, WHICH TAKES A PULSE. jt12_top forms its internal
+  // strobe as `write = !cs_n && !wr_n` -- a LEVEL -- and acts on it inside a
+  // clocked block. A 68000 write cycle at 10 MHz lasts about 400 ns, which
+  // spans three 8 MHz enables, so passing the bus signals straight through
+  // applies every register write three times. Most registers do not care; the
+  // key-on register at 0x28 and the timer controls do, and a bug there would
+  // show up as notes that retrigger rather than as anything obviously wrong.
+  //
+  // So: latch address and data at the START of the cycle and hold the strobe
+  // for exactly one enable. The payload is latched with the edge that raises
+  // the strobe -- gating a capture by the same condition that raises it is a
+  // rule this project has already paid for twice.
+  // THE YM3438's 8.333 MHz IS A RATIO OF clk_sys: 25/(3 x TICK_DEN) -- R227's,
+  // restored (R680). It was a fixed divide by six, right at 50 MHz only, and
+  // the note here said whoever moved the core clock must restore the ratio;
+  // R573 (60) and R580 (70) moved it and did not. At 70 the chip ran at
+  // 11.67 MHz: every FM note 40% sharp and the music 40% fast.
+  //
+  // R820: AND 8.333 WAS NEVER THE CHIP's CLOCK. MAME's is 8,000,000 Hz --
+  // `YM3438(config, m_ym, 16_MHz_XTAL / 2)` in segam1audio.cpp, and -listxml
+  // says the same, as does the note above: a divide by six is 8 MHz only from
+  // 48 MHz. From 50 it was 8.333, and R227 kept that as if it were the part's
+  // own clock. The 68000 sequences the music on the
+  // YM's timer B, so every tempo ran 4.2% fast: the sound board, driven by
+  // MAME's own link bytes, played the attract tune's first 426 notes in MAME's
+  // order and 3.8% sooner. 8 / TICK_DEN of clk_sys is 8 MHz at any core clock.
+  localparam int unsigned YM_NUM = 8;
+  localparam int unsigned YM_DEN = TICK_DEN;
+  logic [$clog2(YM_DEN):0] ym_acc;
+  logic       ym_cen;
+  logic       ym_wr_pend, ym_bus_d;
+  logic [1:0] ym_a_r;
+  logic [7:0] ym_d_r;
+  wire        ym_bus = sel_ym && ds && we;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      ym_acc <= '0; ym_cen <= 1'b0; ym_wr_pend <= 1'b0; ym_bus_d <= 1'b0;
+      ym_a_r <= 2'd0; ym_d_r <= 8'd0;
+    end else begin
+      if (ym_acc + YM_NUM >= YM_DEN) begin
+        ym_acc <= ym_acc + ($clog2(YM_DEN)+1)'(YM_NUM) - ($clog2(YM_DEN)+1)'(YM_DEN);
+        ym_cen <= 1'b1;
+      end else begin
+        ym_acc <= ym_acc + ($clog2(YM_DEN)+1)'(YM_NUM);
+        ym_cen <= 1'b0;
+      end
+      ym_bus_d <= ym_bus;
+      if (ym_bus && !ym_bus_d) begin
+        ym_a_r     <= addr[2:1];
+        ym_d_r     <= oedb[7:0];
+        ym_wr_pend <= 1'b1;
+      end else if (ym_cen) begin
+        ym_wr_pend <= 1'b0;
+      end
+    end
+  end
+
+  wire  [7:0] ym_dout_i;
+  wire signed [15:0] ym_l, ym_r;
+  wire               ym_sample;
+  wire               ym_irq_n;
+
+  // R833: jt12 (YM_STUB 0) or the timer-only stand-in (YM_STUB 1), chosen by
+  // parameter-constant wires as R821 chose the MultiPCM: u_ym keeps its name
+  // and its logic with YM_STUB 0, and with YM_STUB 1 nothing reads it, so
+  // Quartus prunes it. Same inputs to both.
+  wire  [7:0] j_dout, t_dout;
+  wire signed [15:0] j_l, j_r, t_l, t_r;
+  wire               j_sample, t_sample, j_irq_n, t_irq_n;
+  assign ym_dout_i = YM_STUB ? t_dout   : j_dout;
+  assign ym_l      = YM_STUB ? t_l      : j_l;
+  assign ym_r      = YM_STUB ? t_r      : j_r;
+  assign ym_sample = YM_STUB ? t_sample : j_sample;
+  assign ym_irq_n  = YM_STUB ? t_irq_n  : j_irq_n;
+
+  jt12 u_ym (
+    .rst(!rst_n), .clk(clk), .cen(ym_cen),
+    .din(ym_d_r), .addr(ym_a_r),
+    .cs_n(!ym_wr_pend), .wr_n(!ym_wr_pend),
+    .dout(j_dout), .irq_n(j_irq_n),
+    .en_hifi_pcm(1'b0),
+    .snd_right(j_r), .snd_left(j_l), .snd_sample(j_sample)
+  );
+
+  generate if (YM_STUB) begin : g_ymstub
+    m2_ym_timers u_ymt (
+      .rst(!rst_n), .clk(clk), .cen(ym_cen),
+      .din(ym_d_r), .addr(ym_a_r),
+      .cs_n(!ym_wr_pend), .wr_n(!ym_wr_pend),
+      .dout(t_dout), .irq_n(t_irq_n),
+      .en_hifi_pcm(1'b0),
+      .snd_right(t_r), .snd_left(t_l), .snd_sample(t_sample)
+    );
+  end else begin : g_ymjt12
+    assign t_dout = 8'd0; assign t_irq_n = 1'b1; assign t_sample = 1'b0;
+    assign t_l = 16'sd0;  assign t_r = 16'sd0;
+  end endgenerate
+
+  // ----------------------------------------------------------- MULTIPCM x2
+  //
+  // MAME's -listxml gives 10,000,000 Hz for both YMW-258-Fs, which does not
+  // divide 48 -- so this is the same phase accumulator the 68000 needs, at a
+  // single enable rather than two alternating phases.
+  //
+  // AND THIS IS WHERE DAYTONA'S SOUND ACTUALLY IS. Counting the firmware's own
+  // register traffic over a boot: 5,688 writes to the MULTIPCMs against 1,090
+  // to the YM3438. With the sample chips stubbed the board is CORRECTLY silent,
+  // which is what it was -- the FM measured non-zero only while its registers
+  // settled and nothing at all thereafter.
+  // THE CLOCK ENABLE IS NOT A FIXED DIVIDER ANY MORE, and this is the whole
+  // difference between sound that is flat and sound that crackles.
+  //
+  // The chip stops advancing while a fetch is outstanding, so memory latency
+  // stretches the sample PERIOD -- measured at 1075..3015 cycles against a
+  // nominal 1075, which is a sample rate moving by a factor of three from one
+  // sample to the next. A plain 10 MHz enable can only pass that straight
+  // through to the speaker.
+  //
+  // m2_pcm_rate runs each chip ABOVE 10 MHz so it can make up a stall, buffers
+  // what it produces, and drains that buffer at exactly 44,643 Hz. The chip is
+  // throttled by the buffer being full, so its average rate is the drain rate
+  // and its pitch and envelopes -- which advance per sample period -- stay
+  // right. One stage per chip: a stall in one must not throttle the other.
+  wire ce_pcm1, ce_pcm2;
+
+  // The sample banks, at 0xC50000 and 0xC70000. TWO BITS: segam1audio gives
+  // each chip a 2 MB space whose upper megabyte is a window onto one of four
+  // 1 MB pages, so the register selects a page and nothing else. Daytona writes
+  // 0x01 to both, twice, and never changes it.
+  logic [1:0] bank1, bank2;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      bank1 <= 2'd0; bank2 <= 2'd0;
+    end else begin
+      // Written to the ODD byte -- `move.b (A3), $c50001.l` -- so the value is
+      // on the low half of the bus.
+      if (sel_bnk1 && we && ds) bank1 <= oedb[1:0];
+      if (sel_bnk2 && we && ds) bank2 <= oedb[1:0];
+    end
+  end
+
+  wire signed [15:0] p1_l, p1_r, p2_l, p2_r;
+  wire signed [15:0] p1_raw_l, p1_raw_r, p2_raw_l, p2_raw_r;
+  wire               p1_stb, p2_stb;
+
+  wire        p1_creq, p1_cack, p2_creq, p2_cack;
+  wire  [4:0] p1_cslot, p2_cslot;
+  wire [21:0] p1_caddr, p2_caddr;
+  wire  [7:0] p1_cdata, p2_cdata;
+
+  // R821: the two chips' outputs come from u_pcm1 / u_pcm2 (PCM_SHARED 0) or
+  // from one m2_multipcm_dual (PCM_SHARED 1). The selects are on a parameter,
+  // so they are wires: the unused side has no fanout and is not built, and
+  // with PCM_SHARED 0 every instance keeps its name and its logic.
+  wire        s1_creq, s2_creq, s1_stb, s2_stb;
+  wire  [4:0] s1_cslot, s2_cslot;
+  wire [21:0] s1_caddr, s2_caddr;
+  wire signed [15:0] s1_l, s1_r, s2_l, s2_r;
+  wire        d1_creq, d2_creq, d_stb;
+  wire  [4:0] d1_cslot, d2_cslot;
+  wire [21:0] d1_caddr, d2_caddr;
+  wire signed [15:0] d1_l, d1_r, d2_l, d2_r;
+
+  assign p1_creq  = PCM_SHARED ? d1_creq  : s1_creq;
+  assign p1_cslot = PCM_SHARED ? d1_cslot : s1_cslot;
+  assign p1_caddr = PCM_SHARED ? d1_caddr : s1_caddr;
+  assign p1_stb   = PCM_SHARED ? d_stb    : s1_stb;
+  assign p1_raw_l = PCM_SHARED ? d1_l     : s1_l;
+  assign p1_raw_r = PCM_SHARED ? d1_r     : s1_r;
+  assign p2_creq  = PCM_SHARED ? d2_creq  : s2_creq;
+  assign p2_cslot = PCM_SHARED ? d2_cslot : s2_cslot;
+  assign p2_caddr = PCM_SHARED ? d2_caddr : s2_caddr;
+  assign p2_stb   = PCM_SHARED ? d_stb    : s2_stb;
+  assign p2_raw_l = PCM_SHARED ? d2_l     : s2_l;
+  assign p2_raw_r = PCM_SHARED ? d2_r     : s2_r;
+
+  generate if (PCM_SHARED) begin : g_shared
+    // One pass serves both chips, so one enable: u_rate1's. Both rate stages
+    // push on the same strobe and pop on identical accumulators, so their
+    // levels -- and therefore their throttles -- are always equal.
+    // R847: THE 68000's REGISTER WRITE, REGISTERED BEFORE THE ENGINE SEES IT.
+    // aob -> the address decode -> the slot select (fanout 149) -> the 64-way
+    // demux into key_wait / s_active was one cycle (s1130 -0.518, 233 paths;
+    // s1131). Select, strobe, address and data move together, so the engine
+    // sees the same writes in the same order one clk later; a write is held
+    // for many clks of a 68000 bus cycle and nothing reads the chips back.
+    logic       pw_cs0, pw_cs1, pw_we;
+    logic [1:0] pw_a;
+    logic [7:0] pw_d;
+    always_ff @(posedge clk) begin
+      if (!rst_n) begin
+        pw_cs0 <= 1'b0; pw_cs1 <= 1'b0; pw_we <= 1'b0;
+      end else begin
+        pw_cs0 <= sel_pcm1 && ds; pw_cs1 <= sel_pcm2 && ds; pw_we <= we;
+      end
+      pw_a <= addr[2:1]; pw_d <= oedb[7:0];
+    end
+    m2_multipcm_dual u_pcm (
+      .clk(clk), .ce(ce_pcm1), .rst(!rst_n),
+      .cs0(pw_cs0), .cs1(pw_cs1),
+      .we(pw_we), .addr(pw_a), .wdata(pw_d),
+      .rom_req0(d1_creq), .rom_slot0(d1_cslot), .rom_addr0(d1_caddr),
+      .rom_data0(p1_cdata), .rom_ack0(p1_cack),
+      .rom_req1(d2_creq), .rom_slot1(d2_cslot), .rom_addr1(d2_caddr),
+      .rom_data1(p2_cdata), .rom_ack1(p2_cack),
+      .bank_sel0(bank1), .bank_sel1(bank2),
+      .sample_stb(d_stb),
+      .out0_l(d1_l), .out0_r(d1_r), .out1_l(d2_l), .out1_r(d2_r)
+    );
+  end else begin : g_two
+    assign d1_creq = 1'b0; assign d2_creq = 1'b0; assign d_stb = 1'b0;
+    assign d1_cslot = 5'd0; assign d2_cslot = 5'd0;
+    assign d1_caddr = 22'd0; assign d2_caddr = 22'd0;
+    assign d1_l = 16'sd0; assign d1_r = 16'sd0; assign d2_l = 16'sd0; assign d2_r = 16'sd0;
+  end endgenerate
+
+  m2_multipcm u_pcm1 (
+    .clk(clk), .ce(ce_pcm1), .rst(!rst_n),
+    .cs(sel_pcm1 && ds), .we(we), .addr(addr[2:1]), .wdata(oedb[7:0]), .rdata(),
+    .rom_req(s1_creq), .rom_slot(s1_cslot), .rom_addr(s1_caddr),
+    .rom_data(p1_cdata), .rom_ack(p1_cack),
+    .bank_sel(bank1), .sample_stb(s1_stb),
+    .out_l(s1_l), .out_r(s1_r)
+  );
+
+  m2_pcm_fetch #(.BYPASS(!PCM_CACHE)) u_p1fetch (
+    .clk(clk), .rst_n(rst_n),
+    .c_req(p1_creq), .c_slot(p1_cslot), .c_addr(p1_caddr), .c_ack(p1_cack), .c_data(p1_cdata),
+    .m_req(pcm1_rom_req), .m_addr(pcm1_rom_addr),
+    .m_ack(pcm1_rom_ack), .m_data(pcm1_rom_data),
+    .dbg_mean_lat(dbg_pcm_lat), .dbg_miss_1k(dbg_pcm_miss)
+  );
+
+  m2_multipcm u_pcm2 (
+    .clk(clk), .ce(ce_pcm2), .rst(!rst_n),
+    .cs(sel_pcm2 && ds), .we(we), .addr(addr[2:1]), .wdata(oedb[7:0]), .rdata(),
+    .rom_req(s2_creq), .rom_slot(s2_cslot), .rom_addr(s2_caddr),
+    .rom_data(p2_cdata), .rom_ack(p2_cack),
+    .bank_sel(bank2), .sample_stb(s2_stb),
+    .out_l(s2_l), .out_r(s2_r)
+  );
+
+  m2_pcm_fetch #(.BYPASS(!PCM_CACHE)) u_p2fetch (
+    .clk(clk), .rst_n(rst_n),
+    .c_req(p2_creq), .c_slot(p2_cslot), .c_addr(p2_caddr), .c_ack(p2_cack), .c_data(p2_cdata),
+    .m_req(pcm2_rom_req), .m_addr(pcm2_rom_addr),
+    .m_ack(pcm2_rom_ack), .m_data(pcm2_rom_data),
+    .dbg_mean_lat(), .dbg_miss_1k()
+  );
+
+  // --------------------------------------------------- bus cycle / DTACK
+  // Everything but the ROM answers in one cycle. The ROM goes out to memory and
+  // the CPU waits, which is the whole reason DTACK is a state and not a wire.
+  typedef enum logic [1:0] { B_IDLE, B_ROM, B_ACK } bstate_t;
+  bstate_t bst;
+  logic [15:0] rom_q;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      bst <= B_IDLE; rom_req <= 1'b0; dtackn <= 1'b1; rom_q <= 16'd0;
+    end else begin
+      case (bst)
+        B_IDLE: begin
+          dtackn <= 1'b1;
+          if (as && ds) begin
+            if (sel_rom) begin
+              rom_req <= 1'b1;
+              bst     <= B_ROM;
+            end else begin
+              // RAM's registered read has had its cycle by the time the 68000
+              // samples DTACK, and everything else is combinational.
+              dtackn <= 1'b0;
+              bst    <= B_ACK;
+            end
+          end
+        end
+        B_ROM: if (rom_ack) begin
+          rom_q   <= rom_data;
+          rom_req <= 1'b0;
+          dtackn  <= 1'b0;
+          bst     <= B_ACK;
+        end
+        B_ACK: if (!as) begin
+          dtackn <= 1'b1;
+          bst    <= B_IDLE;
+        end
+      endcase
+    end
+  end
+
+  // ------------------------------------------------------------- read mux
+  // UNWRITTEN MEMORY READS 0xFFFF, NEVER ZERO -- the standing rule, and it is
+  // the honest answer for an unmapped address on a bus with pull-ups.
+  always_comb begin
+    if      (sel_rom)  iedb = rom_q;
+    else if (sel_ram)  iedb = {ram_hq, ram_lq};
+    else if (sel_uart) iedb = {8'hff, addr[1] ? uart_stat_o : uart_data_o};
+    else if (sel_ym)   iedb = {8'hff, ym_dout_i};
+    // THE MULTIPCM MUST ANSWER "NOT BUSY" OR THE BOARD NEVER BOOTS. This is a
+    // stub, and the value in it is not arbitrary:
+    //
+    //   00035A: move.b  $c40001.l, D3
+    //   000360: btst    #$0, D3
+    //   000364: bne     $35a
+    //
+    // is the first thing the firmware does after clearing RAM, and it spins
+    // there until bit 0 clears. Left to the unmapped default of 0xFF the bit is
+    // set forever and the 68000 hangs 65,561 instructions in -- having matched
+    // MAME exactly up to that point, which is what makes the failure legible.
+    //
+    // 0x00 says "idle, ready for a command", which is what a real part is a
+    // few microseconds after reset and what MAME's ymw258f reports. When the
+    // real device arrives this whole branch goes with it.
+    else if (sel_pcm1 || sel_pcm2) iedb = 16'hff00;
+    else               iedb = 16'hffff;
+  end
+
+  // ---------------------------------------------------------------- debug
+  logic as_d;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      dbg_pc <= 32'd0; dbg_insns <= 32'd0; as_d <= 1'b0;
+      dbg_ym_writes <= 16'd0; dbg_pcm_writes <= 16'd0;
+      dbg_pcm_samples <= 32'd0;
+    end else begin
+      as_d <= as;
+      if (p1_stb) dbg_pcm_samples <= dbg_pcm_samples + 32'd1;
+      if (as && !as_d) begin
+        dbg_pc <= {8'd0, addr};
+        if (!(&dbg_insns)) dbg_insns <= dbg_insns + 32'd1;
+        if (sel_ym  && we && !(&dbg_ym_writes))  dbg_ym_writes  <= dbg_ym_writes  + 16'd1;
+        if ((sel_pcm1|sel_pcm2) && we && !(&dbg_pcm_writes)) dbg_pcm_writes <= dbg_pcm_writes + 16'd1;
+      end
+    end
+  end
+
+  // THE MIX, SUMMED AND SATURATED (R267). This used to sum the three sources
+  // into 18 bits and shift back down by two, with a comment saying that was
+  // "quieter than the real board and honest about it". Measured against the
+  // reference rather than reasoned about: MAME's own rendering of this game
+  // peaks at 17,140 of 32,767, 52% of full scale, and ours peaked at 2,312 --
+  // 7%, about seven times quieter, and the shift is a factor of four of that.
+  //
+  // The shift was protecting against a clip that the sources cannot reach. Over
+  // the attract the FM peaks at 5,120 and a sample chip at 9,248, so all three
+  // together land near 23,600 of 32,767 with headroom to spare. Summing at full
+  // scale and SATURATING is what the board does -- its DAC clips -- and it
+  // costs nothing on material that never gets there.
+  //
+  // The balance between them is left alone, and the same measurement says it
+  // is right: the reference mixes the FM at 0.30 against 0.5 for each sample
+  // chip (segam1audio.cpp), a ratio of 0.6, and our raw peaks give 5,120 to
+  // 9,248, which is 0.55.
+  // AND THE SUM IS DOUBLED, TO MATCH THE REFERENCE RATHER THAN APPROACH IT.
+  // MAME's rendering of this game peaks at 17,140 of 32,767 and the plain sum
+  // put us at 9,248 -- a factor of 1.85 short, because MAME's devices produce
+  // values well past 16 bits and its 0.30/0.5 route gains bring them back
+  // down, while ours arrive already scaled. Doubling lands at 18,496 against
+  // its 17,140, and the saturation below is what keeps that safe.
+  //
+  // R819: THE GAIN IS RIGHT, THE BALANCE ARGUMENT ABOVE IS NOT. A MultiPCM's
+  // output here is its voices summed and shifted right by two, MAME's is the
+  // sum at unity, so x2 is exactly MAME's 0.5 route gain. But Daytona never
+  // voices the YM3438 -- MAME's ymsnd output is zero through 300 s of attract
+  // and a whole game -- and the 5,120 above was jt12 settling in its first
+  // 0.3 s. The music-to-effects balance is set inside the two MultiPCMs, by
+  // their per-voice level (m2_multipcm, R819). Measured against MAME the YM
+  // path here is ~20 dB hot (x2 on jt12, which is +3.8 dB over ymfm per
+  // operator, against MAME's 0.30): inaudible in Daytona, not yet checked in a
+  // game that voices the FM.
+  wire signed [17:0] sum_l = {{2{ym_l[15]}}, ym_l}
+                           + {{2{p1_l[15]}}, p1_l}
+                           + {{2{p2_l[15]}}, p2_l};
+  wire signed [17:0] sum_r = {{2{ym_r[15]}}, ym_r}
+                           + {{2{p1_r[15]}}, p1_r}
+                           + {{2{p2_r[15]}}, p2_r};
+  wire signed [18:0] mix_l = {sum_l[17], sum_l} <<< 1;
+  wire signed [18:0] mix_r = {sum_r[17], sum_r} <<< 1;
+  function automatic logic signed [15:0] sat16(input logic signed [18:0] v);
+    sat16 = (v > 19'sd32767)  ? 16'sh7FFF
+          : (v < -19'sd32768) ? 16'sh8000
+                              : v[15:0];
+  endfunction
+  // R956: the steps change only on the drain's tick (both rate stages share
+  // its accumulator, and the YM stand-in's audio is 0), so the mix is a
+  // 44,643 Hz staircase. m2_snd_lerp draws the line between its steps, one
+  // sample late. (With jt12 voiced, YM_STUB 0, its own steps would be picked
+  // up at the drain's ticks.)
+  wire signed [15:0] st_l = sat16(mix_l);
+  wire signed [15:0] st_r = sat16(mix_r);
+  wire               p_tick;
+  m2_snd_lerp #(.LERP(LERP && PCM_RATE), .T44_NUM(44643), .T44_DEN(TICK_DEN * 1_000_000)) u_lerp (
+    .clk(clk), .rst_n(rst_n), .tick(p_tick), .tacc(21'd0),
+    .in_l(st_l), .in_r(st_r), .out_l(snd_l), .out_r(snd_r));
+
+  // R573: the MultiPCM rate from TICK_DEN, not the 50 MHz defaults (R227).
+  m2_pcm_rate #(.BYPASS(!PCM_RATE), .CE_DEN(TICK_DEN), .OUT_DEN(TICK_DEN * 1_000_000)) u_rate1 (
+    .clk(clk), .rst_n(rst_n), .ce(ce_pcm1),
+    .s_valid(p1_stb), .s_l(p1_raw_l), .s_r(p1_raw_r),
+    .o_l(p1_l), .o_r(p1_r), .o_tick(p_tick),   // R956
+    .dbg_underruns(dbg_pcm_under), .dbg_level(dbg_pcm_level)
+  );
+
+  m2_pcm_rate #(.BYPASS(!PCM_RATE), .CE_DEN(TICK_DEN), .OUT_DEN(TICK_DEN * 1_000_000)) u_rate2 (
+    .clk(clk), .rst_n(rst_n), .ce(ce_pcm2),
+    .s_valid(p2_stb), .s_l(p2_raw_l), .s_r(p2_raw_r),
+    .o_l(p2_l), .o_r(p2_r), .o_tick(),
+    .dbg_underruns(), .dbg_level()
+  );
+
+  wire _unused = &{1'b0, uart_dout, uart_irq, uart_irq_tx, ym_irq_n, ym_sample,
+                   eab[23:18], 1'b0};
+
+endmodule

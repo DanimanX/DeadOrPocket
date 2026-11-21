@@ -1,5 +1,6 @@
 # DeadOrPocket Compute Cartridge RTL Manifest (Sega Model 2A-CRX)
 set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) cart_rtl/m2_cart_pll.sv]
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) cart_rtl/m2_sd_loader.sv]
 set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) ../cart_rtl/m2_cart_host.sv]
 set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) cart_rtl/m2_cart_top.sv]
 

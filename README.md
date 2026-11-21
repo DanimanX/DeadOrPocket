@@ -10,37 +10,44 @@ Based on the [`alphanu1/sega-model2-mister`](https://github.com/alphanu1/sega-mo
 
 ---
 
-## Phase 3 Milestone — Full Model 2A-CRX Compute Cartridge Verified on `5CEBA5F23C8` (PASS)
+## Phase 3 Milestone — Dual-Board Compute Cartridge (`Model 2` & `Model 2A-CRX`) Verified on `5CEBA5F23C8N` (PASS)
 
-Both FPGAs of the hybrid **DeadOrPocket** system are now **fully implemented, placed, routed, and timing-closed in Intel Quartus Prime 25.1 Lite** with **0 errors and `0.000 ns` TNS across all 4 PVT corners (`Slow 85°C`, `Slow 0°C`, `Fast 85°C`, `Fast 0°C`)**:
+All **three complete FPGA bitstreams** of the hybrid **DeadOrPocket** system are now **fully implemented, pin-locked, placed, routed, and timing-closed in Intel Quartus Prime 25.1 Lite** with **0 errors, 0 STA warnings, and `0.000 ns` TNS across all 4 PVT corners (`Slow 85°C`, `Slow 0°C`, `Fast 85°C`, `Fast 0°C`)**:
 
-- **Compute Cartridge FPGA (`src/cart_fpga/`, Intel Cyclone V `5CEBA5F23C8N` · FBGA-484):** Integrates the complete Sega Model 2A-CRX compute & audio stack (`i960_top` full FPU + `m2_cpu_bridge` + `m2_copro` 4K TGP + `m2_geo` / `m2_geometry` + `m2_2a_sound` 68000/SCSP/DSP + Model 2A I/O & timers + 128 MB dual-chip `m2_sdram` + SPI MicroSD loader + `m2_cart_host` 30-pin PHY) with **all 77 FBGA-484 pins physically locked** ([`cart_pinout.tcl`](src/cart_fpga/cart_pinout.tcl)), plus a complete **KiCad 8 project, JLCPCB/LCSC BOM & CPL, and 3D-printable OpenSCAD enclosure** in [`hardware/`](hardware/) and [`docs/CARTRIDGE_HARDWARE.md`](docs/CARTRIDGE_HARDWARE.md). Pin-compatible with `5CEBA7F23C8N` (`56,480` ALMs).
+- **Compute Cartridge FPGA — Sega Model 2A-CRX (`cart_deadorpocket`, `5CEBA5F23C8N` · 77 Balls Locked):** `i960_top` full FPU + `m2_cpu_bridge` + `m2_copro` 4K TGP + `m2_geo` / `m2_geometry` + `m2_2a_sound` (68000 + SCSP + DSP) + `m2_315_5649` + real SD/SDHC SPI boot loader (`m2_sd_loader`) + 128 MB dual-chip `m2_sdram` + `m2_cart_host` — **84% ALMs (`24,311 / 29,080`)**, **43% M10K**, **9% DSP**, **`+1.653 ns` worst setup slack (`0.000 ns` TNS)**.
+- **Compute Cartridge FPGA — Sega Model 2 Original (`cart_deadorpocket_m2`, `5CEBA5F23C8N` · Exact Same 77-Pin PCB):** `i960_top` + `m2_copro` 2K + `m2_geometry` + **`m2_sound_board` (68000 + YM3438 + 2× MultiPCM)** + **`m2_ioz80` (TV80 Type 1 & Type 2) + `m2_ioboard`** + real `m2_sd_loader` + 128 MB dual `m2_sdram` + `m2_cart_host` (for *Daytona USA*, *Virtua Cop*, *Desert Tank*) — **85% ALMs (`24,794 / 29,080`)**, **45% M10K**, **12% DSP**, **`+1.679 ns` worst setup slack (`0.000 ns` TNS)**.
+- **Complete Hardware Package ([`hardware/`](hardware/), [`docs/CARTRIDGE_HARDWARE.md`](docs/CARTRIDGE_HARDWARE.md)):** Locked 77-ball FBGA-484 pinout ([`cart_pinout.tcl`](src/cart_fpga/cart_pinout.tcl)), KiCad 8 6-layer ENIG schematic & PCB floorplan ([`hardware/deadorpocket_cart/`](hardware/deadorpocket_cart/)), JLCPCB/LCSC production BOM (~$64.64/board) & CPL ([`bom_jlcpcb.csv`](hardware/bom_jlcpcb.csv)), and 3D-printable two-piece OpenSCAD shell ([`deadorpocket_cart_shell.scad`](hardware/shell/deadorpocket_cart_shell.scad)). Pin-compatible upgrade path to `5CEBA7F23C8N` (`56,480` ALMs).
+- **Analogue Pocket Render FPGA (`src/fpga/`, `5CEBA4F23C8`):** Unmodified `m2_raster3d` (bilinear + mip + 2,560 quads) + `m2_video` + Dual Cellular PSRAM Ping-Pong FB + 8-port SDRAM + 30-pin Cart Bus PHY v2 at **57% ALMs (`10,563 / 18,480`)**, **98% M10K (`303 / 308`)**, **83% DSP (`55 / 66`)**, and **`0.000 ns` TNS across all 4 corners**.
+
+<p align="center">
+  <img src="docs/cartridge_pcb_3d.png" alt="DeadOrPocket Compute Cartridge Rev A — 3D PCB Render (6-Layer ENIG, Cyclone V 5CEBA5F23C8N, 128 MB Dual SDR SDRAM)" width="760">
+</p>
+<p align="center"><em>3D hardware render of the <strong>DeadOrPocket Compute Cartridge Rev A</strong> (57.5 × 76.0 mm 6-layer ENIG PCB): central Intel Cyclone V <code>5CEBA5F23C8N</code> (FBGA-484), dual 64 MB ISSI <code>IS42S16320F-6TL</code> SDRAMs, 3× buck power tree, side USB-C auxiliary power, 33 Ω series bus damping bank, and chamfered gold edge fingers.</em></p>
 
 <p align="center">
   <img src="docs/cartridge_pcb_layout.svg" alt="DeadOrPocket Compute Cartridge 6-Layer ENIG PCB Floorplan" width="760">
 </p>
-- **Analogue Pocket Render FPGA (`src/fpga/`, Intel Cyclone V `5CEBA4F23C8`):** Runs unmodified `m2_raster3d` (bilinear + mip + 2,560 quads) + `m2_video` + Dual Cellular PSRAM Ping-Pong FB + 8-port SDRAM + 30-pin Cart Bus PHY v2 at **57% ALMs (`10,563 / 18,480`)**, **98% M10K (`303 / 308`)**, **83% DSP (`55 / 66`)**, and **`0.000 ns` TNS across all 4 corners**.
 
-### Verified Dual-FPGA Silicon Fit Summary (Quartus Prime 25.1 Lite)
+### Verified 3-Bitstream Silicon Fit Matrix (Quartus Prime 25.1 Lite · All 77 Cart Pins Locked)
 
-| Metric | Compute Cartridge (`5CEBA5F23C8N`, 77 Pins Locked) | Analogue Pocket (`5CEBA4F23C8`) | Combined System |
+| Metric | Cart: Model 2A-CRX (`5CEBA5F23C8N`) | Cart: Model 2 Orig. (`5CEBA5F23C8N`) | Analogue Pocket (`5CEBA4F23C8`) |
 |---|---:|---:|---:|
-| **Logic Utilization (ALMs)** | **23,717 / 29,080 (82%)** | **10,563 / 18,480 (57%)** | **34,280 / 47,560 (72%)** |
-| **Registers** | **24,100** | **14,495** | **38,595** |
-| **M10K RAM Blocks** | **190 / 446 (43%)** | **303 / 308 (98%)** | **493 / 754 (65%)** |
-| **DSP Blocks** | **13 / 150 (9%)** | **55 / 66 (83%)** | **68 / 216 (31%)** |
-| **PLLs** | **1 / 6 (17%)** | **2 / 4 (50%)** | **3 / 10 (30%)** |
-| **External Memory** | **128 MB Dual SDR SDRAM** + MicroSD | **64 MB SDRAM + 32 MB Dual PSRAM** *(256 KB SRAM free)* | **224 MB** (Zero DDR3) |
-| **4-Corner TNS (Setup/Hold/Rec/Rem/MPW)** | **0.000 ns** (Worst Setup `+1.947 ns`) | **0.000 ns** (Worst Setup `+0.149 ns`) | **100% Timing Closed** |
+| **Logic Utilization (ALMs)** | **24,311 / 29,080 (84%)** | **24,794 / 29,080 (85%)** | **10,563 / 18,480 (57%)** |
+| **Registers** | **24,784** | **25,683** | **14,495** |
+| **M10K RAM Blocks** | **190 / 446 (43%)** | **201 / 446 (45%)** | **303 / 308 (98%)** |
+| **DSP Blocks** | **13 / 150 (9%)** | **18 / 150 (12%)** | **55 / 66 (83%)** |
+| **PLLs** | **1 / 6 (17%)** | **1 / 6 (17%)** | **2 / 4 (50%)** |
+| **External Memory** | **128 MB Dual SDRAM + MicroSD** | **128 MB Dual SDRAM + MicroSD** | **64 MB SDRAM + 32 MB Dual PSRAM** |
+| **Worst Setup Slack / 4-Corner TNS** | **`+1.653 ns` / `0.000 ns`** | **`+1.679 ns` / `0.000 ns`** | **`+0.149 ns` / `0.000 ns`** |
 
-### Compute Cartridge 4-Corner Static Timing Closure (`5CEBA5F23C8N` — All 77 Balls Locked)
+### Compute Cartridge 4-Corner Static Timing Closure (`5CEBA5F23C8N` — Both Revisions, All 77 Balls Locked)
 
-| Clock Domain | Target Freq | Verified Fmax (Slow 85°C / 0°C) | Slow 85°C Setup | Slow 0°C Setup | Fast 0°C Hold | TNS (All 4 Corners) |
-|---|---:|---:|---:|---:|---:|---:|
-| `clk_mem` (128 MB Dual SDRAM `m2_sdram`) | **100.000 MHz** | **124.18 / 128.07 MHz** | `+1.947 ns` | `+2.192 ns` | `+0.128 ns` | **0.000 ns** |
-| `clk_sys` (TGP + Geometry + SCSP Sound + Bridge) | **50.000 MHz** | **72.48 / 70.29 MHz** | `+6.204 ns` | `+5.774 ns` | `+0.117 ns` | **0.000 ns** |
-| `clk_cpu` (Intel i960KB + Full Subnormal FPU) | **25.000 MHz** | **35.85 / 34.90 MHz** | `+7.196 ns` | `+7.346 ns` | `+0.127 ns` | **0.000 ns** |
-| `clk_bus` (30-Pin Pocket Bus → **63.9 MB/s**) | **31.969 MHz** | **165.32 / 169.43 MHz** | `+25.231 ns` | `+25.378 ns` | `+0.157 ns` | **0.000 ns** |
+| Clock Domain | Target Freq | Model 2A-CRX Fmax / Setup (85°C) | Model 2 Orig. Fmax / Setup (85°C) | Worst Hold (Fast 0°C) | TNS (All 4 Corners) |
+|---|---:|---:|---:|---:|---:|
+| `clk_mem` (128 MB Dual SDRAM + `m2_sd_loader`) | **100.000 MHz** | **119.80 MHz** (`+1.653 ns`) | **120.18 MHz** (`+1.679 ns`) | `+0.166 ns` | **0.000 ns** |
+| `clk_sys` (TGP + Geometry + Sound + I/O + Bridge) | **50.000 MHz** | **71.67 MHz** (`+6.047 ns`) | **63.54 MHz** (`+2.131 ns`) | `+0.117 ns` | **0.000 ns** |
+| `clk_cpu` (Intel i960KB + Full Subnormal FPU) | **25.000 MHz** | **34.45 MHz** (`+7.783 ns`) | **33.52 MHz** (`+7.127 ns`) | `+0.125 ns` | **0.000 ns** |
+| `clk_bus` (30-Pin Pocket Bus → **63.9 MB/s**) | **31.969 MHz** | **217.49 MHz** (`+26.682 ns`) | **161.37 MHz** (`+25.083 ns`) | `+0.155 ns` | **0.000 ns** |
 
 ---
 
@@ -60,6 +67,7 @@ Both sides of the hybrid **Compute Cartridge ↔ 30-Pin Analogue Pocket Cartridg
 | **1. Full 4-Channel Render Co-Sim (`make -C sim run_bus`)** | `m2_cart_host` ↔ 30-pin bus ↔ `m2_cart_bus` ↔ `m2_raster3d` (bilinear+mip+FTB) + `m2_fb_psram` + 2×`psram_phy` + 2×`psram_cell_model` + `m2_video` + `m2_char_cache` + `m2_sdram` (8p) + JEDEC `sdram_model` | **PASS** · `7,445 TX / 7,445 RX` words · **0 contention** · **0 JEDEC SDRAM violations** (`1,040 reads`, `1,024 writes`) · **2,441/2,441 CH2 PCM bit-exact** · **3/3 CH3 inputs bit-exact** · **189,115 / 190,080 3D pixels rendered** |
 | **2. Real Sega Model 2A-CRX ROM Boot (`make -C sim run_m2a`)** | Real Intel `i960_top` (`FP_SUBN=2, RC_RING=1, FR=1, F2A=1`) + `m2_cpu_bridge` booting real **`vf2.rom` (*Virtua Fighter 2*)** → live CPU write snooper → `m2_cart_host` → 30-pin bus → `m2_cart_bus` → Pocket `u_tram`/`u_pal`/`m2_video` | **PASS** · **1,698,138 i960 accesses** (`0 traps`, `0 halts`) · **80,121 live CH1 video writes** (`30,738` TRAM, `5,056` PAL, `44,135` Char/Tex SDRAM) · `145,547 TX / 145,547 RX` words · **0 contention** · **12/12 CH3 VBlank roundtrips** |
 | **3. Real *Dead or Alive* (`doaab.rom`) i960 Boot Check** | Real 90.75 MB `doaab.rom` on `i960_top` (`FR=1, F2A=1`) + `m2_cpu_bridge` (`BOARD_2A=1, prog_ext=1`) | **3,185,370 i960 accesses**, `0 traps`, `0 halts`, `30/30` CH3 VBlank input roundtrips, **0 contention** |
+| **4. Real SD/SDHC SPI Boot Loader (`make -C sim run_sd`)** | `m2_sd_loader.sv` vs behavioral SDHC SPI card (`CMD0/8/55/41/58/17/18/12`, MBR Partition 1 follow, DOP2 header, variable SDRAM backpressure) | **PASS** · **4,096 / 4,096 16-bit words bit-exact** (`game_id=0x16`, `prog_ext=1`, `0 errors`) |
 
 #### Real Silicon Bugs Caught & Fixed by Phase 2 Co-Simulation
 1. **Head-of-line `frame_start` deadlock:** Driving `u_raster3d.frame_start` directly from Pocket's `vblank_pulse_sys` (instead of gating it behind `u_rx_fifo`) eliminated a deadlock when `m2_raster3d` paused `q_ready`.
@@ -193,15 +201,18 @@ Requirements: Intel Quartus Prime 25.1 Lite (`5CEBA4F23C8`), Verilator 5.x, `g++
 # 2. Generate bit-reversed bitstream.rbf_r and Release/DeadOrPocket_Pocket_v0.2.0-phase2.zip
 python3 tools/package_pocket.py --version v0.2.0-phase2
 
-# 3. Compile the Compute Cartridge FPGA (5CEBA5F23C8: map + fit + asm + sta)
-./tools/build_cart.sh
+# 3. Compile BOTH Compute Cartridge FPGA bitstreams (5CEBA5F23C8N, all 77 balls locked)
+./tools/build_cart.sh 2a    # Sega Model 2A-CRX (DOA, VF2, Sega Rally, VC2, Dynamite Cop...)
+./tools/build_cart.sh m2    # Sega Model 2 Original (Daytona USA, Virtua Cop, Desert Tank)
 
-# 4. Run Phase 2 full 4-channel 30-pin Bus + m2_raster3d + Dual PSRAM + SDRAM Verilator co-sim
+# 4. Run Verilator co-simulations (4-channel 30-pin Bus + m2_raster3d + SD/SDHC Boot Loader)
 make -C sim run_bus
+make -C sim run_sd
 
-# 5. (Optional) Verify local MAME .zip ROM sets in roms/ and run real Model 2A i960 ROM boot co-sim
+# 5. (Optional) Verify local MAME .zip ROM sets in roms/, pack MicroSD image & run i960 ROM boot co-sim
 python3 tools/build_rom.py --verify-all
 python3 tools/build_rom.py --mra "Virtua Fighter 2 (Version 2.1).mra" --out roms/out
+python3 tools/make_sd_image.py --rom roms/out/vf2.rom --game-id 0x16 --board 2a --out roms/out/vf2_sd.img
 make -C sim run_m2a
 ```
 
