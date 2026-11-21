@@ -1,0 +1,209 @@
+{
+  "Header": {
+    "GenerationSoftware": {
+      "Application": "DeadOrPocket Gerber Exporter",
+      "Vendor": "DanimanX",
+      "Version": "Rev A"
+    },
+    "CreationDate": "2026-11-21T03:00:00Z"
+  },
+  "GeneralSpecs": {
+    "ProjectId": {
+      "Name": "DeadOrPocket_Cartridge_RevA",
+      "GUID": "64656164-6f72-706f-636b-657463617274",
+      "Revision": "Rev A"
+    },
+    "Size": {
+      "X": 57.5,
+      "Y": 76.0
+    },
+    "LayerNumber": 6,
+    "BoardThickness": 1.0,
+    "Finish": "ENIG"
+  },
+  "DesignRules": [
+    {
+      "Layers": "Outer",
+      "PadToPad": 0.1,
+      "PadToTrack": 0.1,
+      "TrackToTrack": 0.1,
+      "MinLineWidth": 0.127,
+      "TrackToRegion": 0.15,
+      "RegionToRegion": 0.15
+    },
+    {
+      "Layers": "Inner",
+      "PadToPad": 0.1,
+      "PadToTrack": 0.1,
+      "TrackToTrack": 0.1,
+      "MinLineWidth": 0.127,
+      "TrackToRegion": 0.15,
+      "RegionToRegion": 0.15
+    }
+  ],
+  "FilesAttributes": [
+    {
+      "Path": "DeadOrPocket_Cartridge_RevA-F_Cu.gtl",
+      "FileFunction": "Copper,L1,Top",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "DeadOrPocket_Cartridge_RevA-In1_Cu.g2",
+      "FileFunction": "Copper,L2,In,Plane",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "DeadOrPocket_Cartridge_RevA-In2_Cu.g3",
+      "FileFunction": "Copper,L3,In,Signal",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "DeadOrPocket_Cartridge_RevA-In3_Cu.g4",
+      "FileFunction": "Copper,L4,In,Signal",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "DeadOrPocket_Cartridge_RevA-In4_Cu.g5",
+      "FileFunction": "Copper,L5,In,Plane",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "DeadOrPocket_Cartridge_RevA-B_Cu.gbl",
+      "FileFunction": "Copper,L6,Bot",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "DeadOrPocket_Cartridge_RevA-F_Mask.gts",
+      "FileFunction": "Soldermask,Top",
+      "FilePolarity": "Negative"
+    },
+    {
+      "Path": "DeadOrPocket_Cartridge_RevA-B_Mask.gbs",
+      "FileFunction": "Soldermask,Bot",
+      "FilePolarity": "Negative"
+    },
+    {
+      "Path": "DeadOrPocket_Cartridge_RevA-F_Silks.gto",
+      "FileFunction": "Legend,Top",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "DeadOrPocket_Cartridge_RevA-B_Silks.gbo",
+      "FileFunction": "Legend,Bot",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "DeadOrPocket_Cartridge_RevA-F_Paste.gtp",
+      "FileFunction": "Paste,Top",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "DeadOrPocket_Cartridge_RevA-B_Paste.gbp",
+      "FileFunction": "Paste,Bot",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "DeadOrPocket_Cartridge_RevA-Edge_Cuts.gm1",
+      "FileFunction": "Profile,NP",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "DeadOrPocket_Cartridge_RevA-PTH.drl",
+      "FileFunction": "Drill,Plated",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "DeadOrPocket_Cartridge_RevA-NPTH.drl",
+      "FileFunction": "Drill,NonPlated",
+      "FilePolarity": "Positive"
+    }
+  ],
+  "MaterialStackup": [
+    {
+      "Type": "Legend",
+      "Name": "Top Silk Screen"
+    },
+    {
+      "Type": "SolderPaste",
+      "Name": "Top Solder Paste"
+    },
+    {
+      "Type": "SolderMask",
+      "Thickness": 0.01,
+      "Name": "Top Solder Mask"
+    },
+    {
+      "Type": "Copper",
+      "Thickness": 0.035,
+      "Name": "F.Cu (L1 Top)"
+    },
+    {
+      "Type": "Dielectric",
+      "Thickness": 0.1,
+      "Material": "FR4",
+      "Name": "Prepreg 3313"
+    },
+    {
+      "Type": "Copper",
+      "Thickness": 0.0175,
+      "Name": "In1.Cu (L2 GND)"
+    },
+    {
+      "Type": "Dielectric",
+      "Thickness": 0.25,
+      "Material": "FR4",
+      "Name": "Core"
+    },
+    {
+      "Type": "Copper",
+      "Thickness": 0.0175,
+      "Name": "In2.Cu (L3 High-Speed Signal)"
+    },
+    {
+      "Type": "Dielectric",
+      "Thickness": 0.15,
+      "Material": "FR4",
+      "Name": "Prepreg 3313"
+    },
+    {
+      "Type": "Copper",
+      "Thickness": 0.0175,
+      "Name": "In3.Cu (L4 Split Power)"
+    },
+    {
+      "Type": "Dielectric",
+      "Thickness": 0.25,
+      "Material": "FR4",
+      "Name": "Core"
+    },
+    {
+      "Type": "Copper",
+      "Thickness": 0.0175,
+      "Name": "In4.Cu (L5 GND2)"
+    },
+    {
+      "Type": "Dielectric",
+      "Thickness": 0.1,
+      "Material": "FR4",
+      "Name": "Prepreg 3313"
+    },
+    {
+      "Type": "Copper",
+      "Thickness": 0.035,
+      "Name": "B.Cu (L6 Bottom)"
+    },
+    {
+      "Type": "SolderMask",
+      "Thickness": 0.01,
+      "Name": "Bottom Solder Mask"
+    },
+    {
+      "Type": "SolderPaste",
+      "Name": "Bottom Solder Paste"
+    },
+    {
+      "Type": "Legend",
+      "Name": "Bottom Silk Screen"
+    }
+  ]
+}

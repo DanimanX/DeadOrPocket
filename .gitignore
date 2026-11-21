@@ -30,6 +30,8 @@ roms/*
 *.rom
 *.zip
 !Release/DeadOrPocket_Pocket_*.zip
+!Release/DeadOrPocket_Cartridge_*.zip
+!hardware/gerbers/*.zip
 *.7z
 
 # Unpacked SD release staging, Verilator sim build dirs & temporary asset previews

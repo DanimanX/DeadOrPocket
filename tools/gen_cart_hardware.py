@@ -672,3 +672,8 @@ if __name__ == "__main__":
     write_kicad_project()
     write_openscad_shell()
     write_pcb_svg()
+    try:
+        from export_gerbers import generate_all_gerbers
+        generate_all_gerbers()
+    except Exception as e:
+        print(f"[WARN] export_gerbers failed: {e}")

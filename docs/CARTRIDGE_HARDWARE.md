@@ -9,11 +9,13 @@
 ![DeadOrPocket Compute Cartridge 6-Layer ENIG PCB Floorplan](cartridge_pcb_layout.svg)
 
 ### Production Hardware Files ([`hardware/`](../hardware/))
+- **Production RS-274X Gerber Fabrication Archive (ZIP):** [`hardware/gerbers/DeadOrPocket_Cartridge_RevA_Gerbers.zip`](../hardware/gerbers/DeadOrPocket_Cartridge_RevA_Gerbers.zip) · [`Release/DeadOrPocket_Cartridge_RevA_Gerbers.zip`](../Release/DeadOrPocket_Cartridge_RevA_Gerbers.zip)
+- **Gerber & Drill Layer Documentation & Ordering Guide:** [`hardware/gerbers/README.md`](../hardware/gerbers/README.md)
 - **Quartus-Verified Locked FBGA-484 Pinout (77/77 Balls):** [`src/cart_fpga/cart_pinout.tcl`](../src/cart_fpga/cart_pinout.tcl)
 - **KiCad 8 Project, Schematic & 6-Layer PCB Floorplan:** [`hardware/deadorpocket_cart/`](../hardware/deadorpocket_cart/) (`deadorpocket_cart.kicad_pro`, `deadorpocket_cart.kicad_sch`, `deadorpocket_cart.kicad_pcb`)
 - **JLCPCB / LCSC SMT Production BOM & Pick-and-Place CPL:** [`hardware/bom_jlcpcb.csv`](../hardware/bom_jlcpcb.csv) · [`hardware/cpl_jlcpcb.csv`](../hardware/cpl_jlcpcb.csv)
 - **3D-Printable Two-Piece Cartridge Shell (OpenSCAD):** [`hardware/shell/deadorpocket_cart_shell.scad`](../hardware/shell/deadorpocket_cart_shell.scad)
-- **Reproducible Hardware Generator Script:** [`tools/gen_cart_hardware.py`](../tools/gen_cart_hardware.py)
+- **Reproducible Hardware Generator & Gerber Exporter:** [`tools/gen_cart_hardware.py`](../tools/gen_cart_hardware.py) · [`tools/export_gerbers.py`](../tools/export_gerbers.py)
 
 ---
 
@@ -175,3 +177,48 @@ The complete **Sega Model 2A-CRX Compute Cartridge FPGA** ([`src/cart_fpga/cart_
 | **Bank 7A** (North / East) | `3.3V` | **128 MB Dual SDR SDRAM** + **50 MHz TCXO** | 38 | `clk_50m` on **`H13`** (dedicated CLK); `sdram_clk=E19`, `cke=A12`, `cs_n=A13`, `ras/cas/we=A14/A15/B11`, `ba=B12/B13`, `a[12:0]=A17..C11`, `dq[15:0]=C13..E15` (`FAST_OUTPUT_REGISTER` + `FAST_INPUT_REGISTER`) |
 | **Bank 8A** (West edge) | `3.3V` | **MicroSD SPI** + `ext_rst_n` + `led_status[3:0]` | 9 | `sd_sck=A8`, `sd_cs_n=A9`, `sd_mosi=A10`, `sd_miso=B10` (weak PU), `ext_rst_n=A5`, `led[3:0]=A7,B7,B6,B5` |
 | **Bank 3A / 9A** (Dedicated) | `3.3V` | `W25Q64JV` QSPI ASx4 Flash + Tag-Connect JTAG | Dedicated | `MSEL[4:0]=10010` (`F3,E5,A2,J6,L6`), `DCLK=V3`, `nCSO=R4`, `DATA[3:0]=T4,AA5,AB3,AB4`, `JTAG=V5/P5/W5/M5`, `RREF=A1` (`2.00 kΩ` 1% to GND) |
+
+---
+
+## 8. PCB Production Gerber Archive & JLCPCB Manufacturing Guide
+
+The production-ready manufacturing package is available directly in the repository:
+- **Gerbers Archive (ZIP):** [`hardware/gerbers/DeadOrPocket_Cartridge_RevA_Gerbers.zip`](../hardware/gerbers/DeadOrPocket_Cartridge_RevA_Gerbers.zip)
+- **Release Mirror:** [`Release/DeadOrPocket_Cartridge_RevA_Gerbers.zip`](../Release/DeadOrPocket_Cartridge_RevA_Gerbers.zip)
+- **SHA256:** `908a05467146122d0ba7089db6e5b2a8ffa9fa7f5639c41438f94d23f9485026`
+
+### Fabrication Parameters (JLCPCB / PCBWay)
+| Parameter | Required Value | Notes |
+|---|---|---|
+| **Layer Count** | **6 Layers** | Standard JLC06101H-3313 stackup (1.0 mm thickness) |
+| **Dimensions** | **57.5 mm × 76.0 mm** | Lower tongue: 52.0 mm × 12.0 mm |
+| **Board Thickness** | **1.0 mm (±10%)** | **Mandatory** for Analogue Pocket cartridge slot fit (do NOT order 1.6 mm!) |
+| **Surface Finish** | **ENIG** | **Mandatory** for gold edge connector contacts (45–75 µin gold) |
+| **Gold Fingers / Bevel** | **Yes — 30° Chamfer** | Depth 1.0 mm along bottom 32 pins for smooth insertion |
+| **Solder Mask** | Green (or Matte Black) | High contrast against white silkscreen |
+| **Silkscreen** | White | Pin 1 dots, IC footprints, signal callouts, and CE/FCC marks |
+| **Min Track / Spacing** | 5 mil / 5 mil (0.127 mm) | Inner/outer layers compliant with standard pool |
+| **Min Drill Hole** | 0.20 mm | Micro vias (0.20 mm drill / 0.40 mm pad) for BGA escape |
+
+### Archive Contents (17 Files)
+```
+DeadOrPocket_Cartridge_RevA_Gerbers.zip
+├── DeadOrPocket_Cartridge_RevA-F_Cu.gtl       # L1 Top Copper (SMD pads, high-speed traces, gold fingers)
+├── DeadOrPocket_Cartridge_RevA-In1_Cu.g2     # L2 Inner GND Solid Reference Plane
+├── DeadOrPocket_Cartridge_RevA-In2_Cu.g3     # L3 Inner High-Speed Bus (SDRAM + Pocket Bus)
+├── DeadOrPocket_Cartridge_RevA-In3_Cu.g4     # L4 Inner Split Power (1.10V, 2.50V, 3.30V, 5.0V)
+├── DeadOrPocket_Cartridge_RevA-In4_Cu.g5     # L5 Inner GND2 Solid Plane
+├── DeadOrPocket_Cartridge_RevA-B_Cu.gbl       # L6 Bottom Copper (Flash, MicroSD, JTAG, Decoupling)
+├── DeadOrPocket_Cartridge_RevA-F_Mask.gts     # Top Solder Mask
+├── DeadOrPocket_Cartridge_RevA-B_Mask.gbs     # Bottom Solder Mask
+├── DeadOrPocket_Cartridge_RevA-F_Silks.gto    # Top Silkscreen Legend & Component Outlines
+├── DeadOrPocket_Cartridge_RevA-B_Silks.gbo    # Bottom Silkscreen Legend & Pinout
+├── DeadOrPocket_Cartridge_RevA-F_Paste.gtp    # Top Solder Paste Stencil
+├── DeadOrPocket_Cartridge_RevA-B_Paste.gbp    # Bottom Solder Paste Stencil
+├── DeadOrPocket_Cartridge_RevA-Edge_Cuts.gm1  # Mechanical Board Outline & 30° Chamfer Note
+├── DeadOrPocket_Cartridge_RevA-PTH.drl        # Plated Through-Hole Drill File (0.20 mm vias)
+├── DeadOrPocket_Cartridge_RevA-NPTH.drl       # Non-Plated Drill File (2× 2.50 mm shell mounts)
+├── DeadOrPocket_Cartridge_RevA-job.gbrjob     # IPC-2581/Gerber Job Stackup JSON Metadata
+└── README.md                                  # Layer mapping & JLCPCB ordering instructions
+```
+

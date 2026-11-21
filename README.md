@@ -16,7 +16,10 @@ All **three complete FPGA bitstreams** of the hybrid **DeadOrPocket** system are
 
 - **Compute Cartridge FPGA — Sega Model 2A-CRX (`cart_deadorpocket`, `5CEBA5F23C8N` · 77 Balls Locked):** `i960_top` full FPU + `m2_cpu_bridge` + `m2_copro` 4K TGP + `m2_geo` / `m2_geometry` + `m2_2a_sound` (68000 + SCSP + DSP) + `m2_315_5649` + real SD/SDHC SPI boot loader (`m2_sd_loader`) + 128 MB dual-chip `m2_sdram` + `m2_cart_host` — **84% ALMs (`24,311 / 29,080`)**, **43% M10K**, **9% DSP**, **`+1.653 ns` worst setup slack (`0.000 ns` TNS)**.
 - **Compute Cartridge FPGA — Sega Model 2 Original (`cart_deadorpocket_m2`, `5CEBA5F23C8N` · Exact Same 77-Pin PCB):** `i960_top` + `m2_copro` 2K + `m2_geometry` + **`m2_sound_board` (68000 + YM3438 + 2× MultiPCM)** + **`m2_ioz80` (TV80 Type 1 & Type 2) + `m2_ioboard`** + real `m2_sd_loader` + 128 MB dual `m2_sdram` + `m2_cart_host` (for *Daytona USA*, *Virtua Cop*, *Desert Tank*) — **85% ALMs (`24,794 / 29,080`)**, **45% M10K**, **12% DSP**, **`+1.679 ns` worst setup slack (`0.000 ns` TNS)**.
-- **Complete Hardware Package ([`hardware/`](hardware/), [`docs/CARTRIDGE_HARDWARE.md`](docs/CARTRIDGE_HARDWARE.md)):** Locked 77-ball FBGA-484 pinout ([`cart_pinout.tcl`](src/cart_fpga/cart_pinout.tcl)), KiCad 8 6-layer ENIG schematic & PCB floorplan ([`hardware/deadorpocket_cart/`](hardware/deadorpocket_cart/)), JLCPCB/LCSC production BOM (~$64.64/board) & CPL ([`bom_jlcpcb.csv`](hardware/bom_jlcpcb.csv)), and 3D-printable two-piece OpenSCAD shell ([`deadorpocket_cart_shell.scad`](hardware/shell/deadorpocket_cart_shell.scad)). Pin-compatible upgrade path to `5CEBA7F23C8N` (`56,480` ALMs).
+- **Complete Hardware & PCB Fabrication Package ([`hardware/`](hardware/), [`docs/CARTRIDGE_HARDWARE.md`](docs/CARTRIDGE_HARDWARE.md)):**
+  - **Production Gerbers Archive (ZIP):** [`DeadOrPocket_Cartridge_RevA_Gerbers.zip`](hardware/gerbers/DeadOrPocket_Cartridge_RevA_Gerbers.zip) (Mirror: [`Release/DeadOrPocket_Cartridge_RevA_Gerbers.zip`](Release/DeadOrPocket_Cartridge_RevA_Gerbers.zip)) with all 13 standard RS-274X copper/mask/silk/paste/outline layers + Excellon PTH/NPTH drills + `.gbrjob` stackup metadata.
+  - **Manufacturing Specs:** 6-Layer 1.0 mm ENIG PCB (`JLC06101H-3313`), 32 gold edge fingers (1.50 mm pitch) with **30° chamfer bevel**, locked 77-ball FBGA-484 pinout ([`cart_pinout.tcl`](src/cart_fpga/cart_pinout.tcl)), KiCad 8 schematic/PCB floorplan ([`hardware/deadorpocket_cart/`](hardware/deadorpocket_cart/)), JLCPCB SMT BOM & CPL ([`bom_jlcpcb.csv`](hardware/bom_jlcpcb.csv)), and 3D-printable OpenSCAD shell ([`deadorpocket_cart_shell.scad`](hardware/shell/deadorpocket_cart_shell.scad)).
+  - **Pin-Compatible Upgrade Path:** Drop-in upgrade from `5CEBA5F23C8N` (`29,080` ALMs) to `5CEBA7F23C8N` (`56,480` ALMs) with identical ballout.
 - **Analogue Pocket Render FPGA (`src/fpga/`, `5CEBA4F23C8`):** Unmodified `m2_raster3d` (bilinear + mip + 2,560 quads) + `m2_video` + Dual Cellular PSRAM Ping-Pong FB + 8-port SDRAM + 30-pin Cart Bus PHY v2 at **57% ALMs (`10,563 / 18,480`)**, **98% M10K (`303 / 308`)**, **83% DSP (`55 / 66`)**, and **`0.000 ns` TNS across all 4 corners**.
 
 <p align="center">
@@ -205,11 +208,14 @@ python3 tools/package_pocket.py --version v0.2.0-phase2
 ./tools/build_cart.sh 2a    # Sega Model 2A-CRX (DOA, VF2, Sega Rally, VC2, Dynamite Cop...)
 ./tools/build_cart.sh m2    # Sega Model 2 Original (Daytona USA, Virtua Cop, Desert Tank)
 
-# 4. Run Verilator co-simulations (4-channel 30-pin Bus + m2_raster3d + SD/SDHC Boot Loader)
+# 4. Export Complete 6-Layer Production Gerbers & Excellon Drills (ZIP)
+python3 tools/export_gerbers.py
+
+# 5. Run Verilator co-simulations (4-channel 30-pin Bus + m2_raster3d + SD/SDHC Boot Loader)
 make -C sim run_bus
 make -C sim run_sd
 
-# 5. (Optional) Verify local MAME .zip ROM sets in roms/, pack MicroSD image & run i960 ROM boot co-sim
+# 6. (Optional) Verify local MAME .zip ROM sets in roms/, pack MicroSD image & run i960 ROM boot co-sim
 python3 tools/build_rom.py --verify-all
 python3 tools/build_rom.py --mra "Virtua Fighter 2 (Version 2.1).mra" --out roms/out
 python3 tools/make_sd_image.py --rom roms/out/vf2.rom --game-id 0x16 --board 2a --out roms/out/vf2_sd.img
@@ -233,7 +239,8 @@ make -C sim run_m2a
 - [x] **Phase 1 — Pocket Render Core (`src/fpga/`):** Full Analogue Pocket `5CEBA4F23C8` render core (`m2_raster3d` + `m2_video` + Dual-PSRAM Ping-Pong FB + 8-port SDRAM + 30-pin Cart Bus PHY + built-in 3D Self-Test + Kasumi SpaceFish APF assets), fitted with **100% 4-corner timing closure (`0.000 ns TNS`)**.
 - [x] **Phase 2 — Cartridge Bus Protocol v2 & Verilator Co-Simulation (`src/cart_rtl/`, `sim/`):** Implemented symmetric `m2_cart_host.sv` + upgraded `m2_cart_bus.sv` (auto-coalesced live Texture/Char SDRAM streaming, 27-bit `q_tex`, latched VBlank CH3 turnaround), verified end-to-end in Verilator across all 4 channels (0 contention, 0 JEDEC SDRAM violations, 189k+ 3D pixels rendered, real *Virtua Fighter 2* & *Dead or Alive* i960 ROM boot), and re-verified `5CEBA4F23C8` Quartus 25.1 timing closure (`57% ALMs`, `98% M10K`, `0.000 ns TNS`).
 - [x] **Phase 3 — Compute Cartridge FPGA & Hardware Design (`src/cart_fpga/`, [`docs/CARTRIDGE_HARDWARE.md`](docs/CARTRIDGE_HARDWARE.md)):** Finalized Intel Cyclone V **`5CEBA5F23C8`** (pin-compatible with `5CEBA7F23C8`, FBGA-484), completed the full Model 2A-CRX Compute Cartridge FPGA (`i960_top` + `m2_copro` + `m2_geometry` + `m2_2a_sound` + 128 MB dual-chip `m2_sdram` + `m2_cart_host`) verified in Quartus Prime 25.1 Lite at **81% ALMs (`23,673 / 29,080`)**, **43% M10K**, **9% DSP**, and **`0.000 ns` TNS across all 4 PVT corners** (`+2.160 ns` worst setup slack), and authored the 6-layer ENIG PCB, dual-source safe power tree (`TPS2552` 180 mA slot limiter + `TPS2116` USB-C priority mux), and ~$62 prototype BOM.
-- [ ] **Phase 4 — KiCad PCB Layout, Fabrication & Hardware Bring-Up (Model 2A & Model 2):** Capture KiCad 8 schematic/6-layer PCB from [`docs/CARTRIDGE_HARDWARE.md`](docs/CARTRIDGE_HARDWARE.md), fabricate & assemble Rev A cartridge, add Model 2 original (`m2_ioz80` + `m2_sound_board`) variant + FAT32 MicroSD loader, and verify full 57.52 Hz hardware playback across *Dead or Alive*, *Virtua Fighter 2*, *Sega Rally*, and *Daytona USA* (handheld & Dock).
+- [x] **Phase 4 — KiCad PCB Layout, Production Gerbers & 3D Render ([`hardware/gerbers/`](hardware/gerbers/)):** Complete KiCad 8 schematic/PCB floorplan, verified 77 locked pins in silicon, photorealistic 3D PCB render, dual Model 2 + Model 2A bitstream synthesis, and generated complete production RS-274X Gerber & Excellon drill archive ([`DeadOrPocket_Cartridge_RevA_Gerbers.zip`](hardware/gerbers/DeadOrPocket_Cartridge_RevA_Gerbers.zip)) ready for JLCPCB/PCBWay fabrication.
+- [ ] **Phase 5 — Physical Assembly & Hardware Bring-Up:** Fabricate prototype PCBs, SMT assembly with Cyclone V + dual SDRAMs, test boot loader via MicroSD and run full 57.52 Hz hardware playback on Analogue Pocket and Pocket Dock.
 
 ---
 

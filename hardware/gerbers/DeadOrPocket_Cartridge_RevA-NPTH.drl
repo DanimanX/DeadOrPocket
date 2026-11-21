@@ -1,0 +1,14 @@
+M48
+; DRILL file {DeadOrPocket_Cartridge_RevA-NPTH.drl} date 2026-11-21
+; Plated: False
+; FORMAT={3:3}/ absolute / metric / zero suppression leading
+FMAT,2
+METRIC,TZ
+T1C2.500
+%
+G90
+G05
+T1
+X006000Y034000
+X051500Y034000
+M30
