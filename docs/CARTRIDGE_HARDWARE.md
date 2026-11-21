@@ -1,6 +1,15 @@
-# DeadOrPocket Compute Cartridge — Hardware & PCB Specification (Phase 3)
+# DeadOrPocket Compute Cartridge — Hardware & PCB Specification (Rev A)
 
-**Target FPGA:** Intel Cyclone V **`5CEBA5F23C8`** (29,080 ALMs · 446 M10K · 150 DSP · 6 PLLs · FBGA-484 `23 × 23 mm`) — **100% pin-compatible drop-in upgrade path to `5CEBA7F23C8`** (56,480 ALMs · 686 M10K · 156 DSP · same `F23` FBGA-484 footprint!).
+**Target FPGA:** Intel Cyclone V **`5CEBA5F23C8N`** (29,080 ALMs · 446 M10K · 150 DSP · 6 PLLs · FBGA-484 `23 × 23 mm`) — **100% pin-compatible drop-in upgrade path to `5CEBA7F23C8N`** (56,480 ALMs · 686 M10K · 156 DSP · same `F23` FBGA-484 footprint!).
+
+![DeadOrPocket Compute Cartridge 6-Layer ENIG PCB Floorplan](cartridge_pcb_layout.svg)
+
+### Production Hardware Files ([`hardware/`](../hardware/))
+- **Quartus-Verified Locked FBGA-484 Pinout (77/77 Balls):** [`src/cart_fpga/cart_pinout.tcl`](../src/cart_fpga/cart_pinout.tcl)
+- **KiCad 8 Project, Schematic & 6-Layer PCB Floorplan:** [`hardware/deadorpocket_cart/`](../hardware/deadorpocket_cart/) (`deadorpocket_cart.kicad_pro`, `deadorpocket_cart.kicad_sch`, `deadorpocket_cart.kicad_pcb`)
+- **JLCPCB / LCSC SMT Production BOM & Pick-and-Place CPL:** [`hardware/bom_jlcpcb.csv`](../hardware/bom_jlcpcb.csv) · [`hardware/cpl_jlcpcb.csv`](../hardware/cpl_jlcpcb.csv)
+- **3D-Printable Two-Piece Cartridge Shell (OpenSCAD):** [`hardware/shell/deadorpocket_cart_shell.scad`](../hardware/shell/deadorpocket_cart_shell.scad)
+- **Reproducible Hardware Generator Script:** [`tools/gen_cart_hardware.py`](../tools/gen_cart_hardware.py)
 
 ---
 
@@ -135,32 +144,32 @@ The complete **Sega Model 2A-CRX Compute Cartridge FPGA** ([`src/cart_fpga/cart_
 
 ### Silicon Resource Utilization (`5CEBA5F23C8` · FBGA-484)
 
-| Resource | Verified Phase 3 Fit | `5CEBA5F23C8` Ceiling | Utilization | Upgrade Headroom (`5CEBA7F23C8`) |
+| Resource | Verified Locked-Pin Fit | `5CEBA5F23C8N` Ceiling | Utilization | Upgrade Headroom (`5CEBA7F23C8N`) |
 |---|---:|---:|---:|---:|
-| **Logic Utilization (ALMs)** | **23,673** | 29,080 | **81%** *(5,407 ALMs free)* | 42% (56,480 ALMs) |
-| **Total Registers** | **24,079** | — | — | — |
+| **Logic Utilization (ALMs)** | **23,717** | 29,080 | **82%** *(5,363 ALMs free)* | 42% (56,480 ALMs) |
+| **Total Registers** | **24,100** | — | — | — |
 | **M10K RAM Blocks** | **190** (1,425,597 bits) | 446 (4,567,040 bits) | **43% (31% bits)** | 28% (686 M10K) |
 | **DSP Blocks** | **13** | 150 | **9%** | 8% (156 DSP) |
 | **PLLs** | **1** (`m2_cart_pll`) | 6 | **17%** | 17% (6 PLLs) |
-| **User I/O Pins** | **77** | 240 | **32%** | 32% (240 pins) |
+| **Locked User I/O Pins** | **77** (`3.3-V LVTTL`) | 240 | **32%** | 32% (240 pins) |
 
-> **Model 2 Original (`main`) Headroom:** The `5CEBA5F23C8` retains **5,407 free ALMs** and **256 free M10K blocks** — more than **4.5×** the `1,177 ALMs` / `24 M10K` required to swap in Model 2's `m2_ioz80` + `m2_sound_board` (for *Daytona USA*, *Virtua Cop*, *Desert Tank*) and a full FAT32 MicroSD boot controller on the exact same PCB and chip!
+> **Model 2 Original (`main`) Headroom:** The `5CEBA5F23C8N` retains **5,363 free ALMs** and **256 free M10K blocks** — more than **4.5×** the `1,177 ALMs` / `24 M10K` required to swap in Model 2's `m2_ioz80` + `m2_sound_board` (for *Daytona USA*, *Virtua Cop*, *Desert Tank*) and a full FAT32 MicroSD boot controller on the exact same PCB and chip!
 
-### 4-Corner Static Timing Closure (`cart_deadorpocket.sta.summary`)
+### 4-Corner Static Timing Closure (`cart_deadorpocket.sta.summary` — All 77 Balls Locked)
 
 | Clock Domain | Target Freq | Verified Fmax (Slow 85°C / 0°C) | Slow 85°C Setup | Slow 0°C Setup | Fast 0°C Hold | TNS (All 4 Corners) |
 |---|---:|---:|---:|---:|---:|---:|
-| `clk_mem` (128 MB Dual SDRAM `m2_sdram`) | **100.000 MHz** | **127.55 / 129.27 MHz** | `+2.160 ns` | `+2.264 ns` | `+0.153 ns` | **0.000 ns** |
-| `clk_sys` (TGP + Geometry + SCSP Sound + Bridge) | **50.000 MHz** | **73.29 / 72.30 MHz** | `+6.184 ns` | `+6.169 ns` | `+0.120 ns` | **0.000 ns** |
-| `clk_cpu` (Intel i960KB + Full Subnormal FPU) | **25.000 MHz** | **36.50 / 35.90 MHz** | `+8.248 ns` | `+8.505 ns` | `+0.134 ns` | **0.000 ns** |
-| `clk_bus` (30-Pin Pocket Bus → **63.9 MB/s**) | **31.969 MHz** | **179.50 / 184.03 MHz** | `+25.709 ns` | `+25.846 ns` | `+0.169 ns` | **0.000 ns** |
-| **Design-Wide Worst-Case Sign-Off** | All 4 PVT Corners | Recovery `+5.306 ns` · Removal `+0.339 ns` · MPW `+0.625 ns` | **+2.160 ns** | **+2.264 ns** | **+0.120 ns** | **0.000 ns** |
+| `clk_mem` (128 MB Dual SDRAM `m2_sdram`) | **100.000 MHz** | **124.18 / 128.07 MHz** | `+1.947 ns` | `+2.192 ns` | `+0.128 ns` | **0.000 ns** |
+| `clk_sys` (TGP + Geometry + SCSP Sound + Bridge) | **50.000 MHz** | **72.48 / 70.29 MHz** | `+6.204 ns` | `+5.774 ns` | `+0.117 ns` | **0.000 ns** |
+| `clk_cpu` (Intel i960KB + Full Subnormal FPU) | **25.000 MHz** | **35.85 / 34.90 MHz** | `+7.196 ns` | `+7.346 ns` | `+0.127 ns` | **0.000 ns** |
+| `clk_bus` (30-Pin Pocket Bus → **63.9 MB/s**) | **31.969 MHz** | **165.32 / 169.43 MHz** | `+25.231 ns` | `+25.378 ns` | `+0.157 ns` | **0.000 ns** |
+| **Design-Wide Worst-Case Sign-Off** | All 4 PVT Corners | Recovery `+6.236 ns` · Removal `+0.548 ns` · MPW `+0.625 ns` | **+1.947 ns** | **+2.192 ns** | **+0.117 ns** | **0.000 ns** |
 
-### Recommended `FBGA-484` (`F23`) I/O Bank Allocation (77 / 240 Pins Used)
+### Recommended `FBGA-484` (`F23`) Locked I/O Bank Allocation (77 / 240 Pins Used — [`cart_pinout.tcl`](../src/cart_fpga/cart_pinout.tcl))
 
-| Cyclone V Bank | `VCCIO` | Assigned Interface | Pin Count | Routing Notes |
+| Cyclone V Bank | `VCCIO` | Assigned Interface | Pin Count | Locked Balls & Routing Notes |
 |---|---|---|---:|---|
-| **Bank 3B + 4A** (Bottom edge) | `3.3V` | **30-Pin Analogue Pocket Cartridge Bus** (`cart_bank0[7:4]`, `cart_bank1..3[7:0]`, `cart_pin30/31`) | 30 | Direct shortest path to 32-pin edge fingers; `BUS_CLK` on dedicated `CLK*p` pin |
-| **Bank 5A + 5B + 7A** (Top / Right) | `3.3V` | **128 MB Dual SDR SDRAM** (`sdram_clk`, `cke`, `cs_n`, `ras/cas/we_n`, `ba[1:0]`, `a[12:0]`, `dq[15:0]`) | 37 | Matched trace length (`±2.5 mm`); `sdram_clk` on PLL dedicated clock output |
-| **Bank 8A** (Left edge) | `3.3V` | **50 MHz TCXO** (`CLK*p`), **MicroSD SPI** (`sck/cs_n/mosi/miso`), `ext_rst_n`, `led_status[3:0]` | 10 | Short SPI stub to bottom-mounted Hirose `DM3D-SF` MicroSD slot |
-| **ASx4 / JTAG Dedicated** | `3.3V` | `W25Q64JV` QSPI Configuration Flash + 10-pin Tag-Connect JTAG | Dedicated | Standard Cyclone V Active Serial ×4 (`MSEL = 10010`) |
+| **Bank 4A + 5B** (South edge) | `3.3V` | **30-Pin Analogue Pocket Cartridge Bus** | 30 | `BUS_CLK` on **`N16`** (dedicated CLK in 5B); `DIR=P14`, `VSYNC=R14`, `RST_N=T12`, `POCKET_READY=T13`, `CART_VALID=T14`, `PKT_HDR=U13..V16`, `BUS_DATA[15:8]=W16..AA15`, `BUS_DATA[7:0]=AA17..AB21` via `RN1–RN8` 33 Ω arrays |
+| **Bank 7A** (North / East) | `3.3V` | **128 MB Dual SDR SDRAM** + **50 MHz TCXO** | 38 | `clk_50m` on **`H13`** (dedicated CLK); `sdram_clk=E19`, `cke=A12`, `cs_n=A13`, `ras/cas/we=A14/A15/B11`, `ba=B12/B13`, `a[12:0]=A17..C11`, `dq[15:0]=C13..E15` (`FAST_OUTPUT_REGISTER` + `FAST_INPUT_REGISTER`) |
+| **Bank 8A** (West edge) | `3.3V` | **MicroSD SPI** + `ext_rst_n` + `led_status[3:0]` | 9 | `sd_sck=A8`, `sd_cs_n=A9`, `sd_mosi=A10`, `sd_miso=B10` (weak PU), `ext_rst_n=A5`, `led[3:0]=A7,B7,B6,B5` |
+| **Bank 3A / 9A** (Dedicated) | `3.3V` | `W25Q64JV` QSPI ASx4 Flash + Tag-Connect JTAG | Dedicated | `MSEL[4:0]=10010` (`F3,E5,A2,J6,L6`), `DCLK=V3`, `nCSO=R4`, `DATA[3:0]=T4,AA5,AB3,AB4`, `JTAG=V5/P5/W5/M5`, `RREF=A1` (`2.00 kΩ` 1% to GND) |

@@ -1,0 +1,54 @@
+{
+  "board": {
+    "design_settings": {
+      "defaults": {
+        "board_outline_line_width": 0.1,
+        "copper_line_width": 0.127,
+        "via_diameter": 0.4,
+        "via_drill": 0.2
+      },
+      "rules": {
+        "min_clearance": 0.1,
+        "min_track_width": 0.1,
+        "min_via_annular_width": 0.1,
+        "min_via_diameter": 0.4,
+        "min_hole_clearance": 0.2
+      }
+    },
+    "layer_presets": []
+  },
+  "meta": {
+    "filename": "deadorpocket_cart.kicad_pro",
+    "version": 1
+  },
+  "net_settings": {
+    "classes": [
+      {
+        "name": "Default",
+        "clearance": 0.1,
+        "track_width": 0.127,
+        "via_diameter": 0.4,
+        "via_drill": 0.2
+      },
+      {
+        "name": "SDRAM_50R",
+        "clearance": 0.12,
+        "track_width": 0.127,
+        "via_diameter": 0.4,
+        "via_drill": 0.2
+      },
+      {
+        "name": "POWER",
+        "clearance": 0.15,
+        "track_width": 0.5,
+        "via_diameter": 0.6,
+        "via_drill": 0.3
+      }
+    ]
+  },
+  "schematic": {
+    "drawing": {
+      "default_line_thickness": 6.0
+    }
+  }
+}

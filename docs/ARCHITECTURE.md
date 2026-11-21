@@ -153,17 +153,17 @@ Full place-and-route and 4-corner Static Timing Analysis of [`src/fpga/pocket_de
 
 Full place-and-route and 4-corner Static Timing Analysis of the complete Sega Model 2A-CRX Compute Cartridge ([`src/cart_fpga/cart_deadorpocket.qpf`](../src/cart_fpga/cart_deadorpocket.qpf), top-level [`m2_cart_top.sv`](../src/cart_fpga/cart_rtl/m2_cart_top.sv), hardware specification in [`docs/CARTRIDGE_HARDWARE.md`](CARTRIDGE_HARDWARE.md)) targeting Intel Cyclone V **`5CEBA5F23C8`** (pin-compatible with `5CEBA7F23C8`, FBGA-484):
 
-- **Logic utilization (ALMs):** `23,673 / 29,080` (**81%**, leaving **5,407 ALMs free** for Model 2 `m2_ioz80` + FAT32 MicroSD loader)
-- **Total registers:** `24,079`
+- **Logic utilization (ALMs):** `23,717 / 29,080` (**82%**, leaving **5,363 ALMs free** for Model 2 `m2_ioz80` + FAT32 MicroSD loader)
+- **Total registers:** `24,100`
 - **Total block memory bits:** `1,425,597 / 4,567,040` (**31%**)
 - **Total M10K RAM blocks:** `190 / 446` (**43%**)
 - **Total DSP blocks:** `13 / 150` (**9%**)
 - **Total PLLs:** `1 / 6` (**17%**)
-- **Total User I/O Pins:** `77 / 240` (**32%**)
-- **4-Corner STA (`Slow 85C`, `Slow 0C`, `Fast 85C`, `Fast 0C`):** **0.000 ns TNS** across all 4 clock domains (`clk_mem` 100 MHz `+2.160 ns` / Fmax `127.55 MHz`, `clk_sys` 50 MHz `+6.184 ns` / Fmax `73.29 MHz`, `clk_cpu` 25 MHz `+8.248 ns` / Fmax `36.50 MHz`, `clk_bus` 31.97 MHz `+25.709 ns` / Fmax `179.50 MHz`, worst hold `+0.120 ns`, worst-case MTBF `1e+09 years`, 0 STA warnings).
+- **Total Locked User I/O Pins:** `77 / 240` (**32%**, all 77 balls physically locked via `src/cart_fpga/cart_pinout.tcl`, `3.3-V LVTTL`)
+- **4-Corner STA (`Slow 85C`, `Slow 0C`, `Fast 85C`, `Fast 0C`):** **0.000 ns TNS** across all 4 clock domains (`clk_mem` 100 MHz `+1.947 ns` / Fmax `124.18 MHz`, `clk_sys` 50 MHz `+6.204 ns` / Fmax `72.48 MHz`, `clk_cpu` 25 MHz `+7.196 ns` / Fmax `35.85 MHz`, `clk_bus` 31.97 MHz `+25.231 ns` / Fmax `165.32 MHz`, worst hold `+0.117 ns`, worst-case MTBF `1e+09 years`, 0 STA warnings).
 
-### Verified Dual-FPGA Totals (`5CEBA5F23C8` + `5CEBA4F23C8`)
-- **Total Logic:** `34,236 / 47,560 ALMs` (**72%**) · `38,574 registers`
+### Verified Dual-FPGA Totals (`5CEBA5F23C8N` + `5CEBA4F23C8`)
+- **Total Logic:** `34,280 / 47,560 ALMs` (**72%**) · `38,595 registers`
 - **Total Block RAM:** `493 / 754 M10K` (**65%**)
 - **Total DSP:** `68 / 216 DSP` (**31%**)
 - **Timing Sign-Off:** **0.000 ns TNS across all 4 PVT corners on both FPGAs.**

@@ -14,29 +14,33 @@ Based on the [`alphanu1/sega-model2-mister`](https://github.com/alphanu1/sega-mo
 
 Both FPGAs of the hybrid **DeadOrPocket** system are now **fully implemented, placed, routed, and timing-closed in Intel Quartus Prime 25.1 Lite** with **0 errors and `0.000 ns` TNS across all 4 PVT corners (`Slow 85°C`, `Slow 0°C`, `Fast 85°C`, `Fast 0°C`)**:
 
-- **Compute Cartridge FPGA (`src/cart_fpga/`, Intel Cyclone V `5CEBA5F23C8` · FBGA-484):** Integrates the complete Sega Model 2A-CRX compute & audio stack (`i960_top` full FPU + `m2_cpu_bridge` + `m2_copro` 4K TGP + `m2_geo` / `m2_geometry` + `m2_2a_sound` 68000/SCSP/DSP + Model 2A I/O & timers + 128 MB dual-chip `m2_sdram` + SPI MicroSD loader + `m2_cart_host` 30-pin PHY) at **81% ALMs (`23,673 / 29,080`)**, **43% M10K (`190 / 446`)**, **9% DSP (`13 / 150`)**, and **`+2.160 ns` worst-case setup slack** (`0.000 ns` TNS across all 4 corners). Pin-compatible with `5CEBA7F23C8` (`56,480` ALMs). Full schematic/power/PCB/BOM specification in [`docs/CARTRIDGE_HARDWARE.md`](docs/CARTRIDGE_HARDWARE.md).
+- **Compute Cartridge FPGA (`src/cart_fpga/`, Intel Cyclone V `5CEBA5F23C8N` · FBGA-484):** Integrates the complete Sega Model 2A-CRX compute & audio stack (`i960_top` full FPU + `m2_cpu_bridge` + `m2_copro` 4K TGP + `m2_geo` / `m2_geometry` + `m2_2a_sound` 68000/SCSP/DSP + Model 2A I/O & timers + 128 MB dual-chip `m2_sdram` + SPI MicroSD loader + `m2_cart_host` 30-pin PHY) with **all 77 FBGA-484 pins physically locked** ([`cart_pinout.tcl`](src/cart_fpga/cart_pinout.tcl)), plus a complete **KiCad 8 project, JLCPCB/LCSC BOM & CPL, and 3D-printable OpenSCAD enclosure** in [`hardware/`](hardware/) and [`docs/CARTRIDGE_HARDWARE.md`](docs/CARTRIDGE_HARDWARE.md). Pin-compatible with `5CEBA7F23C8N` (`56,480` ALMs).
+
+<p align="center">
+  <img src="docs/cartridge_pcb_layout.svg" alt="DeadOrPocket Compute Cartridge 6-Layer ENIG PCB Floorplan" width="760">
+</p>
 - **Analogue Pocket Render FPGA (`src/fpga/`, Intel Cyclone V `5CEBA4F23C8`):** Runs unmodified `m2_raster3d` (bilinear + mip + 2,560 quads) + `m2_video` + Dual Cellular PSRAM Ping-Pong FB + 8-port SDRAM + 30-pin Cart Bus PHY v2 at **57% ALMs (`10,563 / 18,480`)**, **98% M10K (`303 / 308`)**, **83% DSP (`55 / 66`)**, and **`0.000 ns` TNS across all 4 corners**.
 
 ### Verified Dual-FPGA Silicon Fit Summary (Quartus Prime 25.1 Lite)
 
-| Metric | Compute Cartridge (`5CEBA5F23C8`) | Analogue Pocket (`5CEBA4F23C8`) | Combined System |
+| Metric | Compute Cartridge (`5CEBA5F23C8N`, 77 Pins Locked) | Analogue Pocket (`5CEBA4F23C8`) | Combined System |
 |---|---:|---:|---:|
-| **Logic Utilization (ALMs)** | **23,673 / 29,080 (81%)** | **10,563 / 18,480 (57%)** | **34,236 / 47,560 (72%)** |
-| **Registers** | **24,079** | **14,495** | **38,574** |
+| **Logic Utilization (ALMs)** | **23,717 / 29,080 (82%)** | **10,563 / 18,480 (57%)** | **34,280 / 47,560 (72%)** |
+| **Registers** | **24,100** | **14,495** | **38,595** |
 | **M10K RAM Blocks** | **190 / 446 (43%)** | **303 / 308 (98%)** | **493 / 754 (65%)** |
 | **DSP Blocks** | **13 / 150 (9%)** | **55 / 66 (83%)** | **68 / 216 (31%)** |
 | **PLLs** | **1 / 6 (17%)** | **2 / 4 (50%)** | **3 / 10 (30%)** |
 | **External Memory** | **128 MB Dual SDR SDRAM** + MicroSD | **64 MB SDRAM + 32 MB Dual PSRAM** *(256 KB SRAM free)* | **224 MB** (Zero DDR3) |
-| **4-Corner TNS (Setup/Hold/Rec/Rem/MPW)** | **0.000 ns** (Worst Setup `+2.160 ns`) | **0.000 ns** (Worst Setup `+0.149 ns`) | **100% Timing Closed** |
+| **4-Corner TNS (Setup/Hold/Rec/Rem/MPW)** | **0.000 ns** (Worst Setup `+1.947 ns`) | **0.000 ns** (Worst Setup `+0.149 ns`) | **100% Timing Closed** |
 
-### Compute Cartridge 4-Corner Static Timing Closure (`5CEBA5F23C8`)
+### Compute Cartridge 4-Corner Static Timing Closure (`5CEBA5F23C8N` — All 77 Balls Locked)
 
 | Clock Domain | Target Freq | Verified Fmax (Slow 85°C / 0°C) | Slow 85°C Setup | Slow 0°C Setup | Fast 0°C Hold | TNS (All 4 Corners) |
 |---|---:|---:|---:|---:|---:|---:|
-| `clk_mem` (128 MB Dual SDRAM `m2_sdram`) | **100.000 MHz** | **127.55 / 129.27 MHz** | `+2.160 ns` | `+2.264 ns` | `+0.153 ns` | **0.000 ns** |
-| `clk_sys` (TGP + Geometry + SCSP Sound + Bridge) | **50.000 MHz** | **73.29 / 72.30 MHz** | `+6.184 ns` | `+6.169 ns` | `+0.120 ns` | **0.000 ns** |
-| `clk_cpu` (Intel i960KB + Full Subnormal FPU) | **25.000 MHz** | **36.50 / 35.90 MHz** | `+8.248 ns` | `+8.505 ns` | `+0.134 ns` | **0.000 ns** |
-| `clk_bus` (30-Pin Pocket Bus → **63.9 MB/s**) | **31.969 MHz** | **179.50 / 184.03 MHz** | `+25.709 ns` | `+25.846 ns` | `+0.169 ns` | **0.000 ns** |
+| `clk_mem` (128 MB Dual SDRAM `m2_sdram`) | **100.000 MHz** | **124.18 / 128.07 MHz** | `+1.947 ns` | `+2.192 ns` | `+0.128 ns` | **0.000 ns** |
+| `clk_sys` (TGP + Geometry + SCSP Sound + Bridge) | **50.000 MHz** | **72.48 / 70.29 MHz** | `+6.204 ns` | `+5.774 ns` | `+0.117 ns` | **0.000 ns** |
+| `clk_cpu` (Intel i960KB + Full Subnormal FPU) | **25.000 MHz** | **35.85 / 34.90 MHz** | `+7.196 ns` | `+7.346 ns` | `+0.127 ns` | **0.000 ns** |
+| `clk_bus` (30-Pin Pocket Bus → **63.9 MB/s**) | **31.969 MHz** | **165.32 / 169.43 MHz** | `+25.231 ns` | `+25.378 ns` | `+0.157 ns` | **0.000 ns** |
 
 ---
 
